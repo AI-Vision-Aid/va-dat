@@ -22,6 +22,29 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from bs4 import BeautifulSoup
 
+# ── Deduplication prompt ─────────────────────────────────────────────────────
+
+_DEDUP_PROMPT = """\
+You are reviewing an accessibility audit report for duplicate findings.
+
+Below is a numbered list of findings. Each entry includes an index (IDX), \
+category, element, issue title, and a short description. Identify groups of \
+findings that report the SAME issue on the SAME element or page area. Within \
+each duplicate group, keep the FIRST occurrence and mark the rest for removal.
+
+Only flag true duplicates — findings that are substantively identical in both \
+the problem they describe and the element they affect. Do NOT flag findings \
+that are merely similar or cover related WCAG criteria on different elements.
+
+Return a JSON array of IDX values to REMOVE. If there are no duplicates, \
+return an empty array.
+
+Findings:
+{findings}
+
+Respond with ONLY a JSON array, e.g.: [3, 7, 12]
+"""
+
 
 # ── CSV schema ──────────────────────────────────────────────────────────────
 
@@ -805,15 +828,104 @@ NORMALIZERS: dict[str, callable] = {
 }
 
 
+# ── LLM deduplication pass ────────────────────────────────────────────────────
+
+def deduplicate_with_llm(
+    rows: list[ReportRow],
+    api_key: str,
+    model: str,
+) -> list[ReportRow]:
+    """Use an LLM to remove duplicate findings from *rows*.
+
+    Serializes each row to a compact single-line description, asks the model
+    to identify duplicate IDX values, and filters them out. Returns the
+    deduplicated list. Falls back to the original list on any error.
+
+    Args:
+        rows: Findings after false-positive filtering (IDs not yet assigned).
+        api_key: API key for Anthropic or OpenAI.
+        model: Model ID (e.g. ``claude-sonnet-4-20250514``).
+
+    Returns:
+        A (possibly shorter) list of ReportRow with duplicates removed.
+    """
+    if not rows or not api_key:
+        return rows
+
+    # Build a compact numbered description for each row (1-based IDX).
+    lines = []
+    for idx, row in enumerate(rows, start=1):
+        detail = (row.actual_result or row.issue_title)[:120]
+        lines.append(
+            f"IDX {idx} | {row.category} | {row.element_name} | "
+            f"{row.issue_title} | {detail}"
+        )
+    findings_text = "\n".join(lines)
+
+    prompt = _DEDUP_PROMPT.format(findings=findings_text)
+
+    try:
+        # Detect provider from model ID (same heuristic used elsewhere).
+        is_openai = "gpt" in model.lower() or "o1" in model.lower() or "o3" in model.lower()
+
+        if is_openai:
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model=model,
+                max_tokens=512,
+                temperature=0.0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            response_text = response.choices[0].message.content or "[]"
+        else:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            message = client.messages.create(
+                model=model,
+                max_tokens=512,
+                temperature=0.0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            response_text = "".join(
+                block.text for block in message.content if block.type == "text"
+            )
+
+        to_remove: list[int] = safe_parse_json(response_text)
+        if not isinstance(to_remove, list):
+            raise ValueError(f"Expected list, got {type(to_remove)}")
+
+        remove_set = {int(i) for i in to_remove}
+        original_count = len(rows)
+        deduped = [row for idx, row in enumerate(rows, start=1) if idx not in remove_set]
+        removed = original_count - len(deduped)
+        if removed:
+            print(f"  LLM deduplication removed: {removed} duplicate(s)")
+        return deduped
+
+    except Exception as exc:
+        print(f"  WARNING: LLM deduplication failed ({exc}), skipping.")
+        return rows
+
+
 # ── Main report generation ─────────────────────────────────────────────────
 
-def generate_report(output_dir: Path, report_dir: Path) -> Path:
+def generate_report(
+    output_dir: Path,
+    report_dir: Path,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> Path:
     """Generate a unified CSV report from pipeline output.
 
     Args:
         output_dir: Directory containing manifest.json, programmatic_findings.json,
                     and prompts/ subdirectory.
         report_dir: Directory to write the CSV report into.
+        api_key: Optional API key for the LLM deduplication pass. When omitted
+                 the deduplication step is skipped.
+        model: Model ID to use for deduplication (e.g. ``claude-sonnet-4-20250514``).
+               Required when *api_key* is provided.
 
     Returns:
         Path to the written CSV file.
@@ -825,7 +937,7 @@ def generate_report(output_dir: Path, report_dir: Path) -> Path:
 
     run_timestamp = manifest.get("run_timestamp", "")
     log_date = run_timestamp[:10] if run_timestamp else "unknown"
-    model = manifest.get("model", "unknown")
+    manifest_model = manifest.get("model", "unknown")
 
     # 2. Extract page title from page_title prompt payload
     page_title_data = load_prompt_file(output_dir / "prompts" / "page_title.json")
@@ -879,7 +991,7 @@ def generate_report(output_dir: Path, report_dir: Path) -> Path:
         for row in new_rows:
             row.page_title = page_title
             row.log_date = log_date
-            row.reported_by = model
+            row.reported_by = manifest_model
 
         llm_findings.extend(new_rows)
 
@@ -898,6 +1010,11 @@ def generate_report(output_dir: Path, report_dir: Path) -> Path:
             fp_cats[row.category] = fp_cats.get(row.category, 0) + 1
         for cat, count in sorted(fp_cats.items(), key=lambda x: -x[1]):
             print(f"    {cat}: {count}")
+
+    # 6b. LLM deduplication pass (optional — skipped when no api_key provided)
+    dedup_model = model or manifest_model
+    if api_key and dedup_model:
+        kept = deduplicate_with_llm(kept, api_key, dedup_model)
 
     # 7. Assign sequential IDs
     for i, row in enumerate(kept, start=1):
@@ -920,7 +1037,7 @@ def generate_report(output_dir: Path, report_dir: Path) -> Path:
     print(f"  False positives removed: {len(suppressed)}")
     print(f"  Final rows:           {len(kept)}")
     print(f"  Log date:             {log_date}")
-    print(f"  Model:                {model}")
+    print(f"  Model:                {manifest_model}")
 
     return report_path
 
@@ -944,8 +1061,24 @@ def main():
         default=Path("./test_results/claude"),
         help="Directory to write the CSV report (default: ./test_results/claude/)",
     )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for LLM deduplication pass (optional). "
+             "Falls back to ANTHROPIC_API_KEY / OPENAI_API_KEY env vars if omitted.",
+    )
+    parser.add_argument(
+        "--model",
+        default="claude-sonnet-4-20250514",
+        help="Model to use for LLM deduplication (default: claude-sonnet-4-20250514)",
+    )
     args = parser.parse_args()
-    generate_report(args.output_dir, args.report_dir)
+
+    # Resolve API key from env if not passed explicitly
+    import os
+    api_key = args.api_key or os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+    generate_report(args.output_dir, args.report_dir, api_key=api_key, model=args.model)
 
 
 if __name__ == "__main__":
