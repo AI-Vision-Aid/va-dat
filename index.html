@@ -915,16 +915,16 @@
       </div>
       <p class="sr-only" id="progressStatus" role="status" aria-live="polite">Audit started</p>`;
 
-                // // Simulated progress to keep the user engaged while waiting for Vercel
-                // let progressInterval = setInterval(() => {
-                //   const fillEl = document.getElementById("progressFill");
-                //   if (fillEl) {
-                //     let currentWidth = parseInt(fillEl.style.width);
-                //     if (currentWidth < 90) {
-                //       fillEl.style.width = (currentWidth + 1) + "%";
-                //     }
-                //   }
-                // }, 400);
+                // Simulated progress to keep the user engaged while waiting for Vercel
+                let progressInterval = setInterval(() => {
+                  const fillEl = document.getElementById("progressFill");
+                  if (fillEl) {
+                    let currentWidth = parseInt(fillEl.style.width);
+                    if (currentWidth < 90) {
+                      fillEl.style.width = (currentWidth + 1) + "%";
+                    }
+                  }
+                }, 400);
 
                 try {
                   const res = await fetch(endpoint, {
