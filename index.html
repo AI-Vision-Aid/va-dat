@@ -50,7 +50,7 @@
           </li>
           <li><a href="#lighthouse" class="project-nav-link">Lighthouse</a></li>
           <li>
-            <button class="nav-audit-btn" id="auditTabBtn" aria-pressed="false">
+            <button class="nav-audit-btn active" id="auditTabBtn" aria-pressed="true">
               Audit Tool
             </button>
           </li>
@@ -61,7 +61,7 @@
     <!-- Main Content -->
     <main id="main">
       <!-- ── Project content (hidden when Audit Tool tab is active) ── -->
-      <div id="projectContent">
+      <div id="projectContent" hidden>
         <!-- Hero Section -->
         <section id="hero" class="hero" aria-labelledby="hero-heading">
           <div class="container">
@@ -294,7 +294,6 @@
       <section
         id="auditTool"
         class="audit-section"
-        hidden
         aria-labelledby="audit-heading"
       >
         <div class="container">
