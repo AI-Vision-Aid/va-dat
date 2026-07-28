@@ -66,6 +66,8 @@ MODEL_PRICING = {
     "o3": (2.00, 8.00),
     "o3-mini": (1.10, 4.40),
     "o4-mini": (1.10, 4.40),
+    "gemini-pro-latest": (1.25, 10.00),
+    "gemini-flash-latest": (0.30, 2.50),
     "gemini-2.5-pro": (1.25, 10.00),
     "gemini-2.5-flash": (0.30, 2.50),
 }

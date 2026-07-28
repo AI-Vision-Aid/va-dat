@@ -179,7 +179,9 @@ class GeminiAuditClient:
     Parameters
     ----------
     model : str
-        Gemini model ID to use (default: gemini-2.5-flash).
+        Gemini model ID to use (default: gemini-flash-latest). Prefer the
+        ``-latest`` aliases over dated model IDs (e.g. ``gemini-2.5-flash``),
+        which Google periodically retires for new API keys.
     temperature : float
         Sampling temperature (default: 0.1 for consistent structured output).
     max_tokens : int
@@ -188,7 +190,7 @@ class GeminiAuditClient:
 
     def __init__(
         self,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-flash-latest",
         temperature: float = 0.1,
         max_tokens: int = 8192,
     ):
