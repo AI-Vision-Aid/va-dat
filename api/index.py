@@ -363,8 +363,9 @@ async def handle_validate_key(request: Request):
             # OpenAI keys usually start with sk-
             is_valid = key.startswith("sk-") and len(key) > 20
         elif provider == "gemini":
-            # Gemini keys usually start with AIza
-            is_valid = key.startswith("AIza") and len(key) > 20
+            # Gemini key formats vary (e.g. "AIza...", "AQ...") — length is
+            # the only reliable signal without calling the API.
+            is_valid = len(key) > 20
         else:
             is_valid = len(key) > 10
 
