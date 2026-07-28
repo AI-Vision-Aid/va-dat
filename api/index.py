@@ -17,7 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from entry_points.run_pipeline import run_pipeline
 from entry_points.generate_report import generate_report
 from vision_aid.ingestion.file_crawler import fetch_page, fetch_pages_nested
-from processing_scripts.llm_client.client import is_openai_model
+from processing_scripts.llm_client.client import is_openai_model, is_gemini_model
 
 _PAGE_MARKER = re.compile(r"<!--\s*PAGE:\s*(.*?)\s*-->")
 
@@ -39,6 +39,7 @@ def _resolve_api_key(data: dict, model: str) -> str:
     """Return the appropriate API key for *model* from the request body or env.
 
     OpenAI models use the ``openai_api_key`` field / ``OPENAI_API_KEY`` env.
+    Gemini models use the ``gemini_api_key`` field / ``GEMINI_API_KEY`` env.
     Anthropic models use the ``api_key`` field / ``ANTHROPIC_API_KEY`` env.
     Per-request keys take priority over environment variables.
     """
@@ -46,6 +47,11 @@ def _resolve_api_key(data: dict, model: str) -> str:
         return (
             data.get("openai_api_key", "").strip()
             or os.getenv("OPENAI_API_KEY", "")
+        )
+    if is_gemini_model(model):
+        return (
+            data.get("gemini_api_key", "").strip()
+            or os.getenv("GEMINI_API_KEY", "")
         )
     return (
         data.get("api_key", "").strip()
@@ -356,6 +362,9 @@ async def handle_validate_key(request: Request):
         elif provider == "openai":
             # OpenAI keys usually start with sk-
             is_valid = key.startswith("sk-") and len(key) > 20
+        elif provider == "gemini":
+            # Gemini keys usually start with AIza
+            is_valid = key.startswith("AIza") and len(key) > 20
         else:
             is_valid = len(key) > 10
 

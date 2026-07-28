@@ -66,6 +66,8 @@ MODEL_PRICING = {
     "o3": (2.00, 8.00),
     "o3-mini": (1.10, 4.40),
     "o4-mini": (1.10, 4.40),
+    "gemini-2.5-pro": (1.25, 10.00),
+    "gemini-2.5-flash": (0.30, 2.50),
 }
 
 
@@ -97,7 +99,7 @@ def estimate_tokens(text: str) -> int:
 
 
 class PipelineClient:
-    """Thin wrapper around the Anthropic or OpenAI API.
+    """Thin wrapper around the Anthropic, OpenAI, or Gemini API.
 
     Detects the provider from the model ID and uses the appropriate SDK.
     Returns the same dict shape regardless of provider so downstream code
@@ -105,15 +107,19 @@ class PipelineClient:
     """
 
     def __init__(self, api_key: str, model: str, max_tokens: int = 8192):
-        from processing_scripts.llm_client.client import is_openai_model
+        from processing_scripts.llm_client.client import is_openai_model, is_gemini_model
 
         self.model = model
         self.max_tokens = max_tokens
         self._is_openai = is_openai_model(model)
+        self._is_gemini = is_gemini_model(model)
 
         if self._is_openai:
             import openai
             self._client = openai.OpenAI(api_key=api_key)
+        elif self._is_gemini:
+            from google import genai
+            self._client = genai.Client(api_key=api_key)
         else:
             import anthropic
             self._client = anthropic.Anthropic(api_key=api_key)
@@ -129,6 +135,8 @@ class PipelineClient:
         try:
             if self._is_openai:
                 return self._call_openai(prompt, start)
+            if self._is_gemini:
+                return self._call_gemini(prompt, start)
             return self._call_anthropic(prompt, start)
         except Exception as e:
             return {
@@ -180,6 +188,31 @@ class PipelineClient:
                 "output_tokens": response.usage.completion_tokens,
             },
             "stop_reason": response.choices[0].finish_reason,
+            "duration_seconds": round(time.time() - start, 2),
+        }
+
+    def _call_gemini(self, prompt: str, start: float) -> dict:
+        """Call the Gemini generateContent API."""
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config={
+                "temperature": 0.1,
+                "max_output_tokens": self.max_tokens,
+            },
+        )
+
+        return {
+            "success": True,
+            "response": response.text,
+            "model": self.model,
+            "usage": {
+                "input_tokens": response.usage_metadata.prompt_token_count,
+                "output_tokens": response.usage_metadata.candidates_token_count,
+            },
+            "stop_reason": response.candidates[0].finish_reason.name
+            if response.candidates
+            else None,
             "duration_seconds": round(time.time() - start, 2),
         }
 
@@ -513,11 +546,14 @@ def main():
     # Load environment
     load_dotenv(args.env_file)
 
-    from processing_scripts.llm_client.client import is_openai_model
+    from processing_scripts.llm_client.client import is_openai_model, is_gemini_model
 
     if is_openai_model(args.model):
         api_key = os.getenv("OPENAI_API_KEY")
         key_name = "OPENAI_API_KEY"
+    elif is_gemini_model(args.model):
+        api_key = os.getenv("GEMINI_API_KEY")
+        key_name = "GEMINI_API_KEY"
     else:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         key_name = "ANTHROPIC_API_KEY"

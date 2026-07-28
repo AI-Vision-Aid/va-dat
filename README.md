@@ -177,10 +177,12 @@ source venv/bin/activate        # Linux/macOS
 pip install -e .
 ```
 
-Create a `.env` file with your Anthropic API key (only needed for live runs, not dry-run):
+Create a `.env` file with your provider API key(s) (only needed for live runs, not dry-run):
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
+GEMINI_API_KEY=AIza...
 ```
 
 ## Running the Pipeline
