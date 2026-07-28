@@ -36,7 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from entry_points.run_pipeline import run_pipeline  # noqa: E402
 from entry_points.generate_report import generate_report  # noqa: E402
 from vision_aid.ingestion.file_crawler import fetch_page, fetch_pages_nested  # noqa: E402
-from processing_scripts.llm_client.client import is_openai_model  # noqa: E402
+from processing_scripts.llm_client.client import is_openai_model, is_gemini_model  # noqa: E402
 
 
 # ── Multi-page splitting ─────────────────────────────────────────────────────
@@ -71,6 +71,7 @@ def _resolve_api_key(data: dict, model: str) -> str:
     """Return the appropriate API key for *model* from the request body or env.
 
     OpenAI models use the ``openai_api_key`` field / ``OPENAI_API_KEY`` env.
+    Gemini models use the ``gemini_api_key`` field / ``GEMINI_API_KEY`` env.
     Anthropic models use the ``api_key`` field / ``ANTHROPIC_API_KEY`` env.
     Per-request keys take priority over environment variables.
     """
@@ -78,6 +79,11 @@ def _resolve_api_key(data: dict, model: str) -> str:
         return (
             data.get("openai_api_key", "").strip()
             or os.getenv("OPENAI_API_KEY", "")
+        )
+    if is_gemini_model(model):
+        return (
+            data.get("gemini_api_key", "").strip()
+            or os.getenv("GEMINI_API_KEY", "")
         )
     return (
         data.get("api_key", "").strip()
@@ -527,6 +533,10 @@ class AuditHandler(BaseHTTPRequestHandler):
                 req = urllib.request.Request(
                     "https://api.openai.com/v1/models",
                     headers={"Authorization": f"Bearer {api_key}"},
+                )
+            elif provider == "gemini":
+                req = urllib.request.Request(
+                    f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
                 )
             else:
                 req = urllib.request.Request(
