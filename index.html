@@ -1260,6 +1260,8 @@
               html += `<span class="wcag-tag">${esc(c)}</span>`;
             if (result.status === "dry_run") {
               html += '<span class="llm-badge dry-run">dry run</span>';
+            } else if (result.status === "error") {
+              html += '<span class="llm-badge error">API error</span>';
             } else if (issueN > 0) {
               html += `<span class="llm-badge has-issues">${issueN} issue${
                 issueN !== 1 ? "s" : ""
@@ -1272,7 +1274,13 @@
               '<svg class="llm-chevron" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
             html += "</div>";
             html += '<div class="llm-prompt-body" hidden>';
-            html += renderLLMBody(result.parsed);
+            if (result.status === "error") {
+              html += `<p class="llm-error-message">${esc(
+                result.error || "The API call failed for an unknown reason."
+              )}</p>`;
+            } else {
+              html += renderLLMBody(result.parsed);
+            }
             html += "</div>";
             html += "</div>";
           }

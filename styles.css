@@ -1234,8 +1234,17 @@ section:nth-child(even) {
 .llm-badge.dry-run { background: #fff3cd; color: #7a5200; }
 .llm-badge.has-issues { background: #fde8d4; color: #8a3a00; }
 .llm-badge.pass { background: #d4f0ee; color: #0a5c5f; }
+.llm-badge.error { background: #fbdada; color: #9b1c1c; }
 
 .llm-prompt-body { padding: 18px; }
+.llm-error-message {
+  margin: 0;
+  color: #9b1c1c;
+  font-family: 'SFMono-Regular', 'Consolas', monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* --- Issue cards --- */
 .issue-card {
