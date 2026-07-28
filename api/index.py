@@ -101,19 +101,29 @@ def run_audit(html_content: str, api_key: str, model: str, progress_callback=Non
             for prompt_file in sorted(prompts_dir.glob("*.json")):
                 data = json.loads(prompt_file.read_text(encoding="utf-8"))
                 name = data.get("prompt_name", prompt_file.stem)
-                api_result = data.get("api_result", {})
+                # ``api_result`` is only absent when the pipeline actually ran
+                # in dry-run mode (no key). If it's present but unsuccessful,
+                # a real API call was attempted and failed — that's an error,
+                # not a dry run, and must not be silently treated as one.
+                api_result = data.get("api_result")
                 parsed = None
-                if api_result.get("success"):
+                if api_result is None:
+                    status = "dry_run"
+                elif api_result.get("success"):
+                    status = "success"
                     parsed = _try_parse_json(api_result.get("response", ""))
-                usage = api_result.get("usage", {})
+                else:
+                    status = "error"
+                usage = (api_result or {}).get("usage", {})
                 llm_results[name] = {
                     "checklist": data.get("checklist"),
                     "wcag_criteria": data.get("wcag_criteria", []),
-                    "status": "success" if api_result.get("success") else "dry_run",
+                    "status": status,
+                    "error": (api_result or {}).get("error"),
                     "parsed": parsed,
                     "input_tokens": usage.get("input_tokens"),
                     "output_tokens": usage.get("output_tokens"),
-                    "duration_seconds": api_result.get("duration_seconds"),
+                    "duration_seconds": (api_result or {}).get("duration_seconds"),
                 }
 
         # Generate CSV report (only meaningful when LLM ran)
