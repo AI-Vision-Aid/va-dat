@@ -1,0 +1,56 @@
+# Deployment for Coolify (and plain `docker compose up` locally).
+#
+# Coolify supplies the domain, TLS and reverse proxy itself.  No API keys are
+# configured here or in Coolify: users supply their own in the web form.
+# See DEPLOY.md for the proxy timeout/buffering settings this app needs.
+
+services:
+  audit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: visionaid-a11y-audit:latest
+    restart: unless-stopped
+
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+
+    # No provider API keys are passed in, by design: every user supplies their
+    # own key in the web form, so the deployment never bills a shared account.
+    #
+    # Do NOT "helpfully" add lines like `ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}`.
+    # Compose auto-loads ./.env for ${...} interpolation, so on any developer
+    # machine that has a local .env, that line silently injects their personal
+    # key into the container and every anonymous audit bills it. .dockerignore
+    # keeps .env out of the *image*, but interpolation reads it from the *host*
+    # at run time — a different mechanism that .dockerignore cannot stop.
+    #
+    # If a server-side fallback key is ever genuinely wanted, set it in
+    # Coolify's Environment Variables UI rather than reintroducing that line.
+
+    # Coolify normally routes to the container through its own proxy and you
+    # can drop this mapping.  Keep it for local `docker compose up`; set
+    # HOST_PORT to avoid clashing with a dev server already on 8000.
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT','8000') + '/', timeout=4)
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # Audits write only to per-request tempfile.mkdtemp() directories, so the
+    # root filesystem can stay read-only; /tmp below is the one writable mount.
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+
+    security_opt:
+      - no-new-privileges:true
