@@ -1,6 +1,8 @@
-# visionaid-a11y-llm-audit
+# va-dat — Vision Aid Digital Accessibility Testing
 
 LLM-powered tools that analyze websites for WCAG accessibility issues and generate structured remediation reports. A Computing for Good course project at Georgia Tech (OMSCS) partnered with the Vision Aid Digital Accessibility Testing Team.
+
+There are two ways to use it: a **web app** (paste a URL or HTML, get findings and a CSV) and a **CLI pipeline** for batch or scripted runs. Both share the same analysis code.
 
 ## How It Works
 
@@ -38,10 +40,13 @@ HTML file (e.g. 1.9 MB)
 ## Repository Structure
 
 ```
-├── entry_points/                                # Pipeline entry points
-│   ├── run_pipeline.py                          # Main entry point — runs the full pipeline
-│   ├── generate_report.py                       # Combines findings into unified CSV report
-│   └── get_visionaid_home.py                    # Downloads visionaid.org homepage
+├── index.html                                   # Web UI + team site (all markup/CSS/JS inline)
+├── styles.css
+│
+├── entry_points/                                # Entry points
+│   ├── api_server.py                            # Serves the site and the /api/* audit endpoints
+│   ├── run_pipeline.py                          # Runs the full pipeline from the CLI
+│   └── generate_report.py                       # Combines findings into unified CSV report
 │
 ├── processing_scripts/
 │   ├── llm/                                     # Modular prompt system + templates
@@ -67,28 +72,35 @@ HTML file (e.g. 1.9 MB)
 │   │   ├── forms_checklist_02.py                #   Form accessibility checks
 │   │   └── nontext_checklist_03.py              #   Non-text content checks
 │   │
-│   ├── docs/pipeline.md                         # Pipeline architecture documentation
-│   └── accessibility_audit_walkthrough.ipynb    # Andrew's end-to-end audit notebook
+│   └── docs/pipeline.md                         # Pipeline architecture documentation
 │
-├── test_files/                                 # EXISTING — HTML files to analyze
+├── vision_aid/ingestion/
+│   ├── file_crawler.py                         # fetch_page / fetch_pages_nested (used by the server)
+│   └── pull_html.py                            # Standalone HTML download helper
+│
+├── Dockerfile                                  # Multi-stage uv build → runtime image
+├── docker-compose.yml                          # Local run (Coolify deploys the image directly)
+├── DEPLOY.md                                   # Coolify deployment notes
+│
+├── .github/workflows/
+│   ├── ci.yml                                  # On PR to main: deps, imports, pipeline, image smoke test
+│   └── publish.yml                             # On push to main: build → GHCR → trigger Coolify
+│
+├── test_files/                                 # HTML files to analyze
 │   ├── home.html                               #   visionaid.org homepage (~1.9 MB)
 │   └── dat_visionaid_home.html                 #   Smaller trimmed variant (~143 KB)
 │
-├── semantic_checklist/                         # EXISTING — Source of truth: Deque WCAG checklist PDFs
+├── semantic_checklist/                         # Source of truth: Deque WCAG checklist PDFs
 │   ├── 01-semantic-checklist.pdf
 │   ├── 02-forms-checklist.pdf
 │   └── 03-nontext-checklist.pdf
-│
-├── vision_aid/ingestion/                       # EXISTING — HTML download utility
-│   └── pull_html.py
 │
 ├── pipeline_walkthrough.ipynb                  # Colab-compatible step-by-step pipeline notebook
 │
 ├── docs/                                       # Architecture documentation
 │   └── modular-prompts-plan.md                 #   Full architectural plan
 │
-├── reports/                                    # LLM audit result files
-│   └── audit_*.json                            #   Raw JSON output from llm_client runs
+├── reports/                                    # Raw JSON output from standalone llm_client runs
 │
 ├── test_results/
 │   ├── chatgpt/                                # Legacy ChatGPT testing results
@@ -167,15 +179,50 @@ The normalizer registry mirrors the prompt registry — one normalizer function 
 
 ## Setup
 
-Requires Python 3.11+.
+This project uses [uv](https://docs.astral.sh/uv/). It installs the right
+Python version itself, so there is no separate Python install or `venv` step.
+
+```bash
+# Install uv once (see the uv docs for Windows/other options)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create the environment and install exactly the locked dependencies
+uv sync
+```
+
+Then either prefix commands with `uv run`, or activate the environment:
+
+```bash
+uv run python entry_points/run_pipeline.py --help
+# or
+source .venv/bin/activate        # Linux/macOS
+# or: .venv\Scripts\activate      # Windows
+```
+
+`uv.lock` pins every dependency, including transitive ones, so everyone gets
+an identical environment. To change a dependency, edit `pyproject.toml` and run
+`uv lock`, then regenerate the pip fallback below.
+
+<details>
+<summary>Using pip instead (graders, Colab, or no uv available)</summary>
+
+`requirements.txt` is a generated export of `uv.lock` — **do not edit it by
+hand**; regenerate it with the command in its header. Python 3.11+ required.
 
 ```bash
 python -m venv venv
 source venv/bin/activate        # Linux/macOS
 # or: venv\Scripts\activate     # Windows
 
-pip install -e .
+pip install -r requirements.txt
+pip install -e . --no-deps
 ```
+
+If `python -m venv` fails with an `ensurepip` error, your Python is missing its
+venv module (`sudo apt install python3-venv` on Debian/Ubuntu). uv avoids this
+problem entirely.
+
+</details>
 
 Create a `.env` file with your provider API key(s) (only needed for live runs, not dry-run):
 
@@ -185,6 +232,54 @@ OPENAI_API_KEY=sk-...
 GEMINI_API_KEY=AIza...
 ```
 
+`.env` is gitignored. Never commit a key.
+
+> **A run with no resolvable key silently becomes a dry run** — programmatic
+> checks only, no LLM findings, no CSV, and still a `200 OK` from the web app.
+> The only signal is `summary.dry_run` in the response.
+
+## Running the Web App
+
+```bash
+uv run python entry_points/api_server.py      # http://localhost:8000
+```
+
+Serves the UI and the audit API from one process. Users can paste their own API
+key into the form instead of configuring one server-side; per-request keys take
+priority over the environment.
+
+The audit endpoints stream **NDJSON** — progress events, one JSON object per
+line, then a final `{"type":"result"}` object. Parsing that body with a single
+`res.json()` fails; the front end branches on content type.
+
+To run it in a container:
+
+```bash
+docker compose up --build                     # http://localhost:8000
+HOST_PORT=8789 docker compose up --build      # if 8000 is taken
+```
+
+## Deployment
+
+Merges to `main` build the image, push it to `ghcr.io/c4g/va-dat`, and trigger a
+Coolify deploy to <https://va-dat.c4g.dev>. See [DEPLOY.md](DEPLOY.md) — in
+particular the proxy settings, since response buffering breaks the progress
+stream and short read timeouts cut off long audits.
+
+Note that Coolify runs the **image**; the hardening in `docker-compose.yml`
+(`read_only`, `tmpfs`) applies to local runs only.
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs on every PR to `main` and needs no API key —
+everything it does is free:
+
+- `uv.lock` is in sync with `pyproject.toml`, and `requirements.txt` matches the lock
+- entry points import
+- a full pipeline dry run, asserting prompts generated, findings found, and zero tokens consumed
+- `index.html`'s inline JavaScript parses
+- the Docker image builds, becomes healthy, serves the site, and returns a valid NDJSON audit
+
 ## Running the Pipeline
 
 ### Dry run (no API calls, no cost)
@@ -192,7 +287,7 @@ GEMINI_API_KEY=AIza...
 Generates all prompts and saves them as JSON files so you can inspect them before spending money:
 
 ```bash
-python entry_points/run_pipeline.py --html test_files/dat_visionaid_home.html --dry-run
+uv run python entry_points/run_pipeline.py --html test_files/dat_visionaid_home.html --dry-run
 ```
 
 ### Live run
@@ -200,7 +295,7 @@ python entry_points/run_pipeline.py --html test_files/dat_visionaid_home.html --
 Sends prompts to the LLM and saves responses:
 
 ```bash
-python entry_points/run_pipeline.py --html test_files/home.html
+uv run python entry_points/run_pipeline.py --html test_files/home.html
 ```
 
 ### Generate report
@@ -208,8 +303,8 @@ python entry_points/run_pipeline.py --html test_files/home.html
 After a live run, combine all findings into a single CSV:
 
 ```bash
-python entry_points/generate_report.py
-python entry_points/generate_report.py --output-dir ./output --report-dir ./test_results/claude/
+uv run python entry_points/generate_report.py
+uv run python entry_points/generate_report.py --output-dir ./output --report-dir ./test_results/claude/
 ```
 
 ### Pipeline options

@@ -1,0 +1,38 @@
+# Secrets — never copy into an image layer.  Keys are supplied at runtime via
+# Coolify's environment variables, or per-request from the web form.
+.env
+.env.*
+
+# Local virtualenvs and Python build noise.  Patterns are matched from the
+# build-context root, so nested matches need an explicit **/ prefix.
+venv/
+.venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+build/
+dist/
+
+# Version control and editor/tooling state
+.git/
+.gitignore
+.github/
+.claude/
+.idea/
+.vscode/
+
+# Runtime output — regenerated per audit, never part of the image
+output/
+reports/
+test_results/
+
+# Sample inputs and reference material.  Only needed for the CLI pipeline
+# (entry_points/run_pipeline.py), not for serving the app.  Drop these lines
+# if you want to run the CLI inside the container.
+test_files/
+semantic_checklist/
+docs/
+*.ipynb
+
+# Deployment docs — not needed inside the image
+DEPLOY.md

@@ -316,7 +316,7 @@ Every prompt returns structured JSON. Example responses:
 ## File Map
 
 ```
-visionaid-a11y-llm-audit/
+va-dat/
 │
 ├── semantic_checklist/               <- Deque WCAG reference documents (source of truth)
 │   ├── 01-semantic-checklist.pdf
