@@ -208,3 +208,6 @@ __marimo__/
 
 # Pipeline output
 output/
+
+# CI smoke-test output
+ci-output/

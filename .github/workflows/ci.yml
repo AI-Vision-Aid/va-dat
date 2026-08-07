@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+# A new push to the same PR cancels the previous run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Dependencies, imports, pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+
+      # Fails if pyproject.toml and uv.lock disagree — i.e. someone changed a
+      # dependency without re-running `uv lock`.
+      - name: uv.lock is up to date
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --frozen
+
+      # requirements.txt is a generated export, not a hand-maintained list.
+      # Regenerate it and fail if the committed copy differs.
+      - name: requirements.txt matches uv.lock
+        run: |
+          uv export --format requirements.txt --no-dev --no-emit-project \
+            --no-hashes -o requirements.txt
+          if ! git diff --exit-code --stat -- requirements.txt; then
+            echo "::error::requirements.txt is out of date. Regenerate it with the command in its header and commit the result."
+            exit 1
+          fi
+
+      - name: Entry points import
+        run: |
+          uv run python -c "
+          import entry_points.api_server, entry_points.run_pipeline, entry_points.generate_report
+          from vision_aid.ingestion.file_crawler import fetch_page, fetch_pages_nested
+          print('all entry points import cleanly')
+          "
+
+      # Exercises extractors, slicers, prompt templates and the programmatic
+      # checkers end to end. --dry-run makes no API calls, so this needs no key
+      # and costs nothing.
+      - name: Pipeline dry run
+        run: |
+          uv run python entry_points/run_pipeline.py \
+            --html test_files/dat_visionaid_home.html \
+            --dry-run --output-dir ./ci-output
+
+      - name: Pipeline produced expected output
+        run: |
+          uv run python - <<'PY'
+          import json, pathlib, sys
+
+          manifest = json.loads(pathlib.Path("ci-output/manifest.json").read_text())
+          prompts = list(pathlib.Path("ci-output/prompts").glob("*.json"))
+          findings = json.loads(
+              pathlib.Path("ci-output/programmatic_findings.json").read_text()
+          )
+
+          problems = []
+          if not manifest["dry_run"]:
+              problems.append("manifest says this was not a dry run")
+          if manifest["total_input_tokens"] or manifest["total_output_tokens"]:
+              problems.append("a dry run consumed tokens — an API call escaped")
+          if not manifest["prompts_dry_run"]:
+              problems.append("no prompts were generated")
+          if not findings:
+              problems.append("programmatic checkers found nothing")
+          if len(prompts) != len(manifest["prompts_dry_run"]):
+              problems.append(
+                  f"{len(prompts)} prompt files vs "
+                  f"{len(manifest['prompts_dry_run'])} in manifest"
+              )
+
+          if problems:
+              for p in problems:
+                  print(f"::error::{p}")
+              sys.exit(1)
+
+          print(
+              f"OK — {len(manifest['prompts_dry_run'])} prompts generated, "
+              f"{len(manifest['prompts_skipped'])} skipped, "
+              f"{len(findings)} programmatic findings"
+          )
+          PY
+
+      # index.html carries all of the front-end logic inline, so a syntax error
+      # there ships a broken page with nothing else to catch it.
+      - name: index.html JavaScript parses
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          html = pathlib.Path("index.html").read_text(encoding="utf-8", errors="replace")
+          blocks = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL)
+          assert blocks, "no <script> blocks found in index.html"
+          pathlib.Path("/tmp/inline.js").write_text("\n".join(blocks), encoding="utf-8")
+          print(f"extracted {len(blocks)} script block(s)")
+          PY
+          node --check /tmp/inline.js
+
+  docker:
+    name: Image builds and serves
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t va-dat:ci .
+
+      # No API key is provided, so the audit runs in dry-run mode: programmatic
+      # checks only, no LLM calls, nothing billable.
+      - name: Start container
+        run: |
+          docker run -d --name va-dat-ci -p 8000:8000 \
+            --tmpfs /tmp:size=512m --read-only va-dat:ci
+
+      - name: Wait for healthcheck
+        run: |
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' va-dat-ci)
+            echo "attempt $i: $status"
+            [ "$status" = "healthy" ] && exit 0
+            [ "$status" = "unhealthy" ] && break
+            sleep 2
+          done
+          echo "::error::container never became healthy"
+          docker logs va-dat-ci
+          exit 1
+
+      - name: Serves the site
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/)
+          [ "$code" = "200" ] || { echo "::error::GET / returned $code"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/styles.css)
+          [ "$code" = "200" ] || { echo "::error::GET /styles.css returned $code"; exit 1; }
+
+      - name: Audit endpoint returns a usable NDJSON stream
+        run: |
+          curl -s -D headers.txt -X POST http://localhost:8000/api/audit \
+            -H 'Content-Type: application/json' \
+            -d '{"html_content":"<html><head><title>CI</title></head><body><img src=x><a href=#>click here</a></body></html>"}' \
+            -o body.ndjson
+
+          grep -qi 'application/x-ndjson' headers.txt || {
+            echo "::error::expected an NDJSON content type"; cat headers.txt; exit 1; }
+
+          python3 - <<'PY'
+          import json, pathlib, sys
+
+          lines = [
+              json.loads(l)
+              for l in pathlib.Path("body.ndjson").read_text().splitlines()
+              if l.strip()
+          ]
+          results = [l for l in lines if l.get("type") == "result"]
+          progress = [l for l in lines if l.get("type") == "progress"]
+
+          problems = []
+          if len(results) != 1:
+              problems.append(f"expected exactly 1 result event, got {len(results)}")
+          if not progress:
+              problems.append("no progress events — the stream is not streaming")
+          if results:
+              r = results[0]
+              if not r.get("success"):
+                  problems.append(f"audit failed: {r.get('error')}")
+              if not r["summary"]["dry_run"]:
+                  problems.append("ran with an API key — CI must never bill an account")
+              if not r.get("programmatic_findings"):
+                  problems.append("no programmatic findings returned")
+
+          if problems:
+              for p in problems:
+                  print(f"::error::{p}")
+              sys.exit(1)
+
+          print(
+              f"OK — {len(progress)} progress events, "
+              f"{len(results[0]['programmatic_findings'])} findings"
+          )
+          PY
+
+      - name: Container logs
+        if: always()
+        run: docker logs va-dat-ci || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f va-dat-ci || true
