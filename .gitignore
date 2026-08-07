@@ -211,3 +211,6 @@ output/
 
 # CI smoke-test output
 ci-output/
+
+# Stray git worktrees — never belong in the index
+.claude/worktrees/
