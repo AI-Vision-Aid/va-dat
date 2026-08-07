@@ -13,83 +13,106 @@ The system has three planned stages:
 
 ```
 project-root/
-├── index.html                       # Team/project website (served via GitHub Pages)
-├── styles.css                       # Website styles
+├── index.html                       # Web UI + team site (served by api_server.py)
+├── styles.css
+├── entry_points/
+│   ├── api_server.py                # HTTP server: static site + /api/* audit endpoints
+│   ├── run_pipeline.py              # CLI pipeline orchestrator
+│   └── generate_report.py           # Pipeline output → unified CSV
 ├── processing_scripts/
 │   ├── llm/                         # Modular prompt system
-│   │   ├── registry.py              # PromptSpec dataclass + PROMPT_REGISTRY (21 specs)
-│   │   ├── slicers.py               # Payload slicer functions (one per prompt)
-│   │   ├── templates.py             # Prompt .txt parser + {payload} filler
-│   │   ├── semantic_checklist_01.txt # 7 prompts for semantic structure (CL01)
-│   │   ├── forms_checklist_02.txt   # 6 prompts for forms (CL02)
-│   │   └── nontext_checklist_03.txt # 8 prompts for non-text content (CL03)
+│   │   ├── registry.py              #   PromptSpec dataclass + PROMPT_REGISTRY
+│   │   ├── slicers.py               #   Payload slicer functions (one per prompt)
+│   │   ├── filters.py               #   Pass-1 payload filters
+│   │   ├── templates.py             #   Prompt .txt parser + {payload} filler
+│   │   └── *_checklist_0*.txt       #   Prompt templates (CL01/CL02/CL03)
 │   ├── llm_preprocessing/           # HTML → structured JSON extractors
-│   │   ├── semantic_checklist_01.py  # CL01 extractor
-│   │   ├── forms_checklist_02.py    # CL02 extractor
-│   │   └── nontext_checklist_03.py  # CL03 extractor
-│   └── programmatic/                # Rule-based checks (no API needed)
-│       └── semantic_checklist_01.py  # Missing alt, duplicate IDs, etc.
-├── entry_points/
-│   ├── run_pipeline.py              # Full pipeline orchestrator
-│   ├── generate_report.py           # JSON → CSV report generator
-│   └── get_visionaid_home.py        # HTML downloader
-├── test_files/                      # HTML files to analyze (may be very large, 500K+ tokens)
-└── docs/
-    └── modular-prompts-plan.md      # Architecture plan
+│   ├── programmatic/                # Rule-based checks (no API needed)
+│   └── llm_client/                  # Provider client (Anthropic/OpenAI/Gemini)
+├── vision_aid/ingestion/
+│   ├── file_crawler.py              # fetch_page / fetch_pages_nested (used by the server)
+│   └── pull_html.py                 # Standalone HTML download helper
+├── Dockerfile                       # Multi-stage uv build → runtime image
+├── docker-compose.yml               # Local run; Coolify deploys the image directly
+├── DEPLOY.md                        # Coolify deployment notes (proxy settings matter)
+├── .github/workflows/
+│   ├── ci.yml                       # On PR to main: deps, imports, pipeline, image smoke
+│   └── publish.yml                  # On push to main: build → GHCR → trigger Coolify
+├── test_files/                      # HTML inputs (may be very large, 500K+ tokens)
+└── docs/modular-prompts-plan.md
 ```
 
-## Website (GitHub Pages)
+## Environment & Dependencies
 
-The team project website lives at the repo root (`index.html` + `styles.css`). It is a pure HTML5/CSS3 static site with no build tools or JavaScript frameworks — served directly via GitHub Pages from the main branch root.
+This project uses **uv**. There is no `pip install` step and no hand-managed `venv`.
 
-- Design: DM Serif Display + DM Sans, teal/amber palette, fully responsive
-- Accessibility: skip link, semantic HTML, ARIA landmarks, WCAG AA contrast
-- Lighthouse scores (last measured): Performance 92 · Accessibility 96 · Best Practices 100 · SEO 100
-- Do not add JavaScript or external CSS frameworks to the website
+```bash
+uv sync                    # create .venv and install from uv.lock
+uv run python <script>     # run inside that environment
+```
 
-## Tech Stack
+- `pyproject.toml` is the **only** hand-edited dependency list.
+- `uv.lock` is committed and pins everything, including transitive deps.
+- `requirements.txt` is a **generated export** — never edit it by hand. Regenerate with the command in its header. CI fails if it drifts from the lock.
+- `.python-version` pins 3.12 to match the container. `requires-python` is `>=3.11`.
 
-- Python 3.x (use virtual environment: `source venv/bin/activate`)
-- Anthropic API (Claude Sonnet 4 preferred for testing — `claude-sonnet-4-20250514`)
-- HTML preprocessing: BeautifulSoup / custom parsers (check imports in preprocessing files)
-- Accessibility tools context: axe-core, Lighthouse, WAVE (hybrid approach)
-- Output format: CSV with columns — ID, element_name, browser_combination, page_title, issue_title, steps_to_reproduce, actual_result, expected_result, recommendation, wcag_sc, category, log_date, reported_by
+After changing a dependency: edit `pyproject.toml`, run `uv lock`, regenerate `requirements.txt`, and commit all three.
 
 ## Pipeline Usage
 
 ```bash
-# Dry run (no API key needed) — generates prompts and payloads
-python entry_points/run_pipeline.py --html test_files/home.html --dry-run
+# Dry run (no API key needed, no cost) — generates prompts and payloads
+uv run python entry_points/run_pipeline.py --html test_files/dat_visionaid_home.html --dry-run
 
-# Full run with API
-python entry_points/run_pipeline.py --html test_files/home.html
+# Full run (spends money — see the rules below)
+uv run python entry_points/run_pipeline.py --html test_files/home.html
 
-# Generate CSV report from pipeline output
-python entry_points/generate_report.py
+# CSV report from pipeline output
+uv run python entry_points/generate_report.py
+
+# Web UI + API at http://localhost:8000
+uv run python entry_points/api_server.py
 ```
+
+## The Web Server
+
+`entry_points/api_server.py` is the single server — it serves `index.html`/`styles.css` and handles the audit endpoints. There is deliberately no second copy of the audit logic; the project previously carried two and they drifted until one silently skipped LLM deduplication.
+
+The audit endpoints (`/api/audit`, `/api/audit/url`, `/api/audit/url/nested`) return an **NDJSON stream**: progress events one JSON object per line, then a final `{"type":"result"}`. Parsing that body with a single `JSON.parse`/`res.json()` throws "Unexpected non-whitespace character after JSON" — the front end branches on content type to handle it.
+
+## Deployment
+
+Docker image → GHCR (`ghcr.io/c4g/va-dat`) → Coolify at `https://va-dat.c4g.dev`.
+`publish.yml` builds and pushes on merge to `main`, then triggers the Coolify deploy. Coolify runs the **image**, not `docker-compose.yml` — the hardening in that compose file (`read_only`, `tmpfs`) applies to local runs only. See `DEPLOY.md`, especially the proxy buffering/timeout section: buffering breaks the progress stream, and short read timeouts cut off long audits.
 
 ## Code Patterns
 
 - Prompt templates are `.txt` files with `{payload}` placeholders, parsed by `processing_scripts/llm/templates.py`
-- The registry (`processing_scripts/llm/registry.py`) maps each evaluation task to its prompt file, slicer, and WCAG criteria
-- Slicer functions (`processing_scripts/llm/slicers.py`) extract targeted JSON slices from extractor payloads
-- The pipeline runner (`entry_points/run_pipeline.py`) orchestrates: programmatic checks → extraction → slicing → prompt filling → API calls
+- `processing_scripts/llm/registry.py` maps each evaluation task to its prompt file, slicer, and WCAG criteria
+- Slicer functions in `processing_scripts/llm/slicers.py` extract targeted JSON slices from extractor payloads
+- `entry_points/run_pipeline.py` orchestrates: programmatic checks → extraction → slicing → prompt filling → API calls
 - File encoding: use `encoding='utf-8', errors='replace'` when reading HTML files
 
 ## Style Rules
 
-- Python code: standard PEP 8
+- Python: standard PEP 8
 - Docstrings for all new functions
 - Use `pathlib.Path` for file paths (consistent with existing scripts)
 - Commit messages: descriptive, prefixed with area (e.g., "prompts: add element-specific template system")
+- `index.html` contains the entire front end inline (HTML + CSS + JS). Keep it dependency-free — no frameworks, no external CDN assets.
 
 ## Do NOT
 
-- Do not call the Anthropic API or spend any money unless explicitly testing
-- Do not install new dependencies without team agreement
-- Do not modify test_files/ or any HTML input files
+- **Do not call any LLM API or spend money unless explicitly asked to test.** Prefer `--dry-run`.
+- Do not install or remove dependencies without team agreement.
+- Do not modify `test_files/` or any HTML input files.
+- Do not edit `requirements.txt` by hand — regenerate it.
+- Do not add `ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}` (or similar) to `docker-compose.yml`. Compose auto-loads `./.env` for `${...}` interpolation, so that line silently injects a developer's personal key into the container and bills it for every anonymous audit.
 
 ## Common Issues
 
-- HTML test files can be enormous (500K+ tokens) — do not try to read them fully into context
-- Some files may have non-UTF-8 encoding; always use `errors='replace'`
+- **A dry run can still spend money.** `dry_run` is derived from whether a key resolves, and `_resolve_api_key` falls back to the environment — and `api_server.py` calls `load_dotenv()`. Sending `api_key: ""` from a client does **not** force a dry run when `.env` exists. To guarantee no spend, run with no key available at all.
+- **Silent dry runs.** A request with no resolvable key returns `200 OK` with no LLM findings and no CSV. The only signal is `summary.dry_run` in the response.
+- HTML test files can be enormous (500K+ tokens) — do not read them fully into context.
+- Some files may have non-UTF-8 encoding; always use `errors='replace'`.
+- Model defaults differ by entry point: `run_pipeline.py` uses `claude-sonnet-4-20250514`, `api_server.py` uses `claude-haiku-4-5-20251001`.

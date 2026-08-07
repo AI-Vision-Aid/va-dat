@@ -7,7 +7,7 @@
 The project has two parallel approaches to accessibility auditing, at different stages of completion:
 
 ```
-visionaid-a11y-llm-audit/
+va-dat/
 │
 ├── scripts/
 │   └── run_factorial_test.py          # Approach A: Monolithic (BROKEN — imports missing modules)
@@ -143,7 +143,7 @@ Output is a list of finding dicts, each with `issue_code`, `element` (tag/id/cla
 ### 2.2 Directory Structure
 
 ```
-visionaid-a11y-llm-audit/
+va-dat/
 ├── processing_scripts/
 │   ├── llm/                       # Modular prompt system + prompt text files
 │   │   ├── __init__.py
