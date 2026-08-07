@@ -938,7 +938,9 @@
       </div>
       <p class="sr-only" id="progressStatus" role="status" aria-live="polite">Audit started</p>`;
 
-                // Simulated progress to keep the user engaged while waiting for Vercel
+                // Simulated progress, used only when the backend returns a
+                // single buffered JSON object with no progress events. An
+                // NDJSON stream clears this and drives the bar for real.
                 let progressInterval = setInterval(() => {
                   const fillEl = document.getElementById("progressFill");
                   if (fillEl) {
@@ -961,8 +963,28 @@
                     throw new Error(`Server Error: ${res.status} - ${errorText}`);
                   }
 
-                  // Vercel returns the full result at once
-                  const data = await res.json();
+                  // The server (entry_points/api_server.py) answers audits with
+                  // an NDJSON stream: progress events, one JSON object per
+                  // line, then a final {"type":"result"} object.  Parsing that
+                  // with res.json() throws "Unexpected non-whitespace character
+                  // after JSON", so the content type decides which reader to
+                  // use — the plain-JSON branch is a fallback for any backend
+                  // that buffers the whole result into a single object.
+                  const contentType = res.headers.get("content-type") || "";
+                  let data;
+
+                  if (contentType.includes("ndjson")) {
+                    // Real progress events supersede the simulated bar.
+                    clearInterval(progressInterval);
+                    data = await readNdjsonStream(res, updateProgress);
+                    if (!data) {
+                      throw new Error(
+                              "The server closed the connection before returning a result."
+                      );
+                    }
+                  } else {
+                    data = await res.json();
+                  }
 
                   clearInterval(progressInterval);
 
@@ -987,7 +1009,7 @@
         <div class="audit-error" role="alert">
           <strong>Audit Failed</strong><br>
           ${esc(err.message)}<br><br>
-          <small>Check the Vercel Dashboard logs for Python tracebacks.</small>
+          <small>See the browser console for details. If this keeps happening, check that your API key is valid, or review the server logs.</small>
         </div>`;
                   resultsSection.style.display = "block";
                 } finally {
@@ -995,6 +1017,92 @@
                   submitBtn.textContent = "Run Audit";
                 }
               });
+
+      // Approximate completion percentage for each named pipeline stage.
+      // Per-prompt and per-page events are interpolated between these.
+      const STAGE_PCT = {
+        starting: 5,
+        fetching: 8,
+        fetch_complete: 12,
+        crawl_complete: 15,
+        programmatic_complete: 18,
+        extraction_complete: 20,
+        report_generating: 92,
+        report_complete: 97,
+      };
+
+      /**
+       * Read an NDJSON response body, dispatching each {"type":"progress"}
+       * event to onProgress and returning the final {"type":"result"} object,
+       * or null if the stream ended without one.
+       */
+      async function readNdjsonStream(res, onProgress) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let result = null;
+
+        const handleLine = (line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          let evt;
+          try {
+            evt = JSON.parse(trimmed);
+          } catch {
+            // A single malformed line should not abort an otherwise good run.
+            return;
+          }
+          if (evt.type === "result") result = evt;
+          else if (evt.type === "progress" && onProgress) onProgress(evt);
+        };
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop(); // last element may be a partial line
+          lines.forEach(handleLine);
+        }
+        handleLine(buffer); // flush whatever remained unterminated
+
+        return result;
+      }
+
+      /** Update the progress bar and status text from a server progress event. */
+      function updateProgress(evt) {
+        const msgEl = document.getElementById("progressMessage");
+        const fillEl = document.getElementById("progressFill");
+        const detailEl = document.getElementById("progressDetail");
+        const statusEl = document.getElementById("progressStatus");
+
+        if (evt.message) {
+          if (msgEl) msgEl.textContent = evt.message;
+          if (statusEl) statusEl.textContent = evt.message;
+        }
+
+        let pct = null;
+        if (evt.stage === "llm_progress" && evt.total) {
+          // Prompt calls dominate the runtime, so they own the 20–90% band.
+          pct = 20 + Math.round((evt.completed / evt.total) * 70);
+          if (detailEl) {
+            detailEl.textContent =
+                    `Prompt ${evt.completed} of ${evt.total}` +
+                    (evt.prompt_name ? ` — ${evt.prompt_name}` : "");
+          }
+        } else if (evt.stage === "auditing_page" && evt.total_pages) {
+          pct = Math.round((evt.page / evt.total_pages) * 90);
+          if (detailEl) {
+            detailEl.textContent = `Page ${evt.page} of ${evt.total_pages}`;
+          }
+        } else if (STAGE_PCT[evt.stage] != null) {
+          pct = STAGE_PCT[evt.stage];
+        }
+
+        if (pct != null && fillEl) {
+          fillEl.style.width = Math.min(pct, 95) + "%";
+        }
+      }
 
       // 868: Added 'data' parameter to access the csv_report string
       function attachResultListeners(container, data) {
