@@ -880,13 +880,17 @@ def deduplicate_with_llm(
             response_text = response.choices[0].message.content or "[]"
         else:
             import anthropic
+            from processing_scripts.llm_client.client import supports_temperature
+
             client = anthropic.Anthropic(api_key=api_key)
-            message = client.messages.create(
-                model=model,
-                max_tokens=512,
-                temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            request_kwargs = {
+                "model": model,
+                "max_tokens": 512,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if supports_temperature(model):
+                request_kwargs["temperature"] = 0.0
+            message = client.messages.create(**request_kwargs)
             response_text = "".join(
                 block.text for block in message.content if block.type == "text"
             )
@@ -1069,8 +1073,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="claude-sonnet-4-20250514",
-        help="Model to use for LLM deduplication (default: claude-sonnet-4-20250514)",
+        default="claude-sonnet-5",
+        help="Model to use for LLM deduplication (default: claude-sonnet-5)",
     )
     args = parser.parse_args()
 

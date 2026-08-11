@@ -313,7 +313,7 @@ uv run python entry_points/generate_report.py --output-dir ./output --report-dir
 |------|---------|-------------|
 | `--html` | (required) | Path to the HTML file to analyze |
 | `--output-dir` | `./output` | Directory for results |
-| `--model` | `claude-sonnet-4-20250514` | Anthropic model to use |
+| `--model` | `claude-sonnet-5` | Anthropic model to use |
 | `--dry-run` | off | Generate prompts without calling the API |
 | `--include-summaries` | off | Include the 3 cross-cutting summary prompts |
 | `--show-cost` | off | Print estimated dollar cost of the run based on model pricing |

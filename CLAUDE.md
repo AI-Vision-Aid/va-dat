@@ -115,4 +115,4 @@ Docker image → GHCR (`ghcr.io/c4g/va-dat`) → Coolify at `https://va-dat.c4g.
 - **Silent dry runs.** A request with no resolvable key returns `200 OK` with no LLM findings and no CSV. The only signal is `summary.dry_run` in the response.
 - HTML test files can be enormous (500K+ tokens) — do not read them fully into context.
 - Some files may have non-UTF-8 encoding; always use `errors='replace'`.
-- Model defaults differ by entry point: `run_pipeline.py` uses `claude-sonnet-4-20250514`, `api_server.py` uses `claude-haiku-4-5-20251001`.
+- Model defaults differ by entry point: `run_pipeline.py` uses `claude-sonnet-5`, `api_server.py` uses `claude-haiku-4-5-20251001`.

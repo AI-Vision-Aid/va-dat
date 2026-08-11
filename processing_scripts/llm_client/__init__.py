@@ -7,7 +7,7 @@ Usage
 -----
     from llm_client import create_audit_client, load_all_prompts, run_all
 
-    client = create_audit_client(model="claude-sonnet-4-6")   # or "gpt-4o"
+    client = create_audit_client(model="claude-sonnet-5")   # or "gpt-4o"
     prompts = load_all_prompts(PROMPTS_DIR)
     report  = run_all(client, prompts, all_slices)
 """

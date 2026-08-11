@@ -53,6 +53,9 @@ from processing_scripts.programmatic.nontext_checklist_03 import audit_nontext
 
 # Pricing per million tokens: (input, output)
 MODEL_PRICING = {
+    "claude-fable-5": (10.00, 50.00),
+    "claude-opus-5": (5.00, 25.00),
+    "claude-sonnet-5": (3.00, 15.00),
     "claude-sonnet-4": (3.00, 15.00),
     "claude-opus-4": (15.00, 75.00),
     "claude-haiku-4": (0.80, 4.00),
@@ -149,12 +152,17 @@ class PipelineClient:
 
     def _call_anthropic(self, prompt: str, start: float) -> dict:
         """Call the Anthropic Messages API."""
-        message = self._client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            temperature=0.1,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        from processing_scripts.llm_client.client import supports_temperature
+
+        request_kwargs = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if supports_temperature(self.model):
+            request_kwargs["temperature"] = 0.1
+
+        message = self._client.messages.create(**request_kwargs)
 
         response_text = "".join(
             block.text for block in message.content if block.type == "text"
@@ -519,8 +527,11 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="claude-sonnet-4-20250514",
-        help="Model to use (default: claude-sonnet-4-20250514)",
+        default="claude-sonnet-5",
+        help=(
+            "Model to use (default: claude-sonnet-5). Accepts any "
+            "Claude, OpenAI, or Gemini model ID, e.g. claude-fable-5."
+        ),
     )
     parser.add_argument(
         "--dry-run",

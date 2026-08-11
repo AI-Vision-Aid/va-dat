@@ -34,6 +34,25 @@ def is_gemini_model(model: str) -> bool:
     return model.startswith(_GEMINI_PREFIXES)
 
 
+# Claude models (Opus 4.6+, Sonnet 4.6+, Fable/Mythos 5) that reject
+# temperature/top_p/top_k (400 error) in favor of adaptive thinking + effort.
+_NO_SAMPLING_PARAMS_MODELS = {
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+}
+
+
+def supports_temperature(model: str) -> bool:
+    """Return False for Claude models that reject the `temperature` param."""
+    return model not in _NO_SAMPLING_PARAMS_MODELS
+
+
 class AuditClient:
     """
     Sends filled accessibility-audit prompts to the Claude API and returns
@@ -42,16 +61,21 @@ class AuditClient:
     Parameters
     ----------
     model : str
-        Claude model ID to use (default: claude-sonnet-4-6).
+        Claude model ID to use (default: claude-sonnet-5). Also accepts
+        ``claude-opus-5`` and ``claude-fable-5``, Anthropic's most capable
+        model. Newer Claude models (Opus 4.6+, Sonnet 4.6+, Fable/Mythos 5)
+        reject a ``temperature`` param entirely (see ``supports_temperature``),
+        which this client already accounts for.
     temperature : float
         Sampling temperature (default: 0.1 for consistent structured output).
+        Silently omitted from the request for models that reject it.
     max_tokens : int
         Maximum tokens to generate per response (default: 8192).
     """
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-sonnet-5",
         temperature: float = 0.1,
         max_tokens: int = 8192,
     ):
@@ -82,12 +106,15 @@ class AuditClient:
         """
         filled = prompt_text.replace("{payload}", json.dumps(payload, separators=(",", ":")))
 
-        message = self._client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            messages=[{"role": "user", "content": filled}],
-        )
+        request_kwargs = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": [{"role": "user", "content": filled}],
+        }
+        if supports_temperature(self.model):
+            request_kwargs["temperature"] = self.temperature
+
+        message = self._client.messages.create(**request_kwargs)
 
         usage = {
             "input_tokens": message.usage.input_tokens,
@@ -243,7 +270,7 @@ class GeminiAuditClient:
 
 
 def create_audit_client(
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-sonnet-5",
     temperature: float = 0.1,
     max_tokens: int = 8192,
 ) -> AuditClient | OpenAIAuditClient | GeminiAuditClient:
