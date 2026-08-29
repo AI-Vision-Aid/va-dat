@@ -66,6 +66,8 @@ MODEL_PRICING = {
     "gpt-4.1": (2.00, 8.00),
     "gpt-4.1-mini": (0.40, 1.60),
     "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-5.6-sol": (4.00, 20.00),
+    "gpt-5.6": (4.00, 20.00),
     "o3": (2.00, 8.00),
     "o3-mini": (1.10, 4.40),
     "o4-mini": (1.10, 4.40),
@@ -181,7 +183,26 @@ class PipelineClient:
         }
 
     def _call_openai(self, prompt: str, start: float) -> dict:
-        """Call the OpenAI Chat Completions API."""
+        """Call OpenAI, using Responses for GPT-5 reasoning models."""
+        if self.model.startswith("gpt-5"):
+            response = self._client.responses.create(
+                model=self.model,
+                input=prompt,
+                max_output_tokens=self.max_tokens,
+                reasoning={"effort": "low"},
+            )
+            return {
+                "success": True,
+                "response": response.output_text,
+                "model": response.model,
+                "usage": {
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                },
+                "stop_reason": response.status,
+                "duration_seconds": round(time.time() - start, 2),
+            }
+
         response = self._client.chat.completions.create(
             model=self.model,
             max_tokens=self.max_tokens,

@@ -19,6 +19,8 @@ file / environment.  Per-request keys take priority.
 """
 
 import json
+import hashlib
+import hmac
 import os
 import re
 import shutil
@@ -26,6 +28,7 @@ import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -37,6 +40,8 @@ from entry_points.run_pipeline import run_pipeline  # noqa: E402
 from entry_points.generate_report import generate_report  # noqa: E402
 from vision_aid.ingestion.file_crawler import fetch_page, fetch_pages_nested  # noqa: E402
 from processing_scripts.llm_client.client import is_openai_model, is_gemini_model  # noqa: E402
+from vision_aid.site_audit.crawler import validate_public_url  # noqa: E402
+from vision_aid.site_audit.jobs import get_coordinator  # noqa: E402
 
 
 # ── Multi-page splitting ─────────────────────────────────────────────────────
@@ -243,10 +248,22 @@ class AuditHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         path = self.path.split("?")[0]
+        if path not in ("/api/health", "/styles.css") and not self._site_access_allowed():
+            if path in ("/", "/index.html") or path.endswith("/report"):
+                self._serve_login_page()
+            else:
+                self._send_json({"success": False, "error": "Authentication required"}, 401)
+            return
         if path in ("/", "/index.html"):
             self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         elif path == "/styles.css":
             self._serve_file(STATIC_DIR / "styles.css", "text/css; charset=utf-8")
+        elif path == "/api/health":
+            self._handle_health()
+        elif re.fullmatch(r"/api/site-audits/[A-Za-z0-9_-]+/report", path):
+            self._handle_site_audit_report(path)
+        elif re.fullmatch(r"/api/site-audits/[A-Za-z0-9_-]+", path):
+            self._handle_site_audit_status(path)
         else:
             self.send_error(404, "Not Found")
 
@@ -265,7 +282,17 @@ class AuditHandler(BaseHTTPRequestHandler):
     # POST ─────────────────────────────────────────────────────────────────────
 
     def do_POST(self):  # noqa: N802
-        if self.path == "/api/audit":
+        if self.path == "/api/login":
+            self._handle_login()
+        elif self.path.startswith("/api/internal/site-audits/"):
+            operation = self.path.rsplit("/", 1)[-1]
+            if operation not in {"discover", "page", "finalize"}:
+                self.send_error(404, "Not Found")
+                return
+            self._handle_internal_site_audit(operation)
+        elif not self._site_access_allowed():
+            self._send_json({"success": False, "error": "Authentication required"}, 401)
+        elif self.path == "/api/audit":
             self._handle_audit()
         elif self.path == "/api/audit/url":
             self._handle_url_audit(nested=False)
@@ -273,8 +300,69 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._handle_url_audit(nested=True)
         elif self.path == "/api/validate-key":
             self._handle_validate_key()
+        elif self.path == "/api/site-audits":
+            self._handle_create_site_audit()
         else:
             self.send_error(404, "Not Found")
+
+    def _site_access_cookie(self) -> str:
+        password = os.getenv("DAT_SITE_PASSWORD", "").strip()
+        if not password:
+            return ""
+        return hashlib.sha256(f"vision-aid-dat:{password}".encode("utf-8")).hexdigest()
+
+    def _site_access_allowed(self) -> bool:
+        """Return whether the shared-password cookie is valid."""
+        expected = self._site_access_cookie()
+        if not expected:
+            return True
+        cookies = self.headers.get("Cookie", "")
+        supplied = ""
+        for item in cookies.split(";"):
+            name, _, value = item.strip().partition("=")
+            if name == "dat_access":
+                supplied = value
+                break
+        return bool(supplied and hmac.compare_digest(expected, supplied))
+
+    def _serve_login_page(self):
+        body = b"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Vision Aid DAT sign in</title>
+<style>body{font-family:Arial,sans-serif;background:#eef4fb;color:#172033;margin:0;display:grid;min-height:100vh;place-items:center}.card{background:white;border:1px solid #c8d5e6;border-radius:12px;padding:32px;max-width:420px;width:calc(100% - 48px);box-shadow:0 10px 30px #17345c22}label{display:block;font-weight:700;margin:18px 0 6px}input,button{box-sizing:border-box;width:100%;padding:12px;font:inherit;border-radius:7px}input{border:1px solid #8194ac}button{margin-top:16px;background:#184b8a;color:white;border:0;font-weight:700;cursor:pointer}.error{color:#a32121}</style></head>
+<body><main class="card"><p>Vision Aid Digital Accessibility Testing</p><h1>Team testing access</h1>
+<form id="login"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required autofocus>
+<button type="submit">Open DAT tool</button><p id="error" class="error" role="alert"></p></form></main>
+<script>document.getElementById('login').addEventListener('submit',async(e)=>{e.preventDefault();const error=document.getElementById('error');error.textContent='';const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});if(res.ok){location.reload();return;}error.textContent='Incorrect password.';});</script></body></html>"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_login(self):
+        try:
+            data = self._read_json_body()
+        except ValueError as exc:
+            self._send_json({"success": False, "error": str(exc)}, 400)
+            return
+        expected_password = os.getenv("DAT_SITE_PASSWORD", "").strip()
+        supplied = str(data.get("password", ""))
+        if not expected_password or not hmac.compare_digest(expected_password, supplied):
+            self._send_json({"success": False, "error": "Incorrect password"}, 401)
+            return
+        body = json.dumps({"success": True}).encode("utf-8")
+        secure_flag = "; Secure" if os.getenv("K_SERVICE") or self.headers.get(
+            "X-Forwarded-Proto", ""
+        ).lower() == "https" else ""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Set-Cookie",
+            f"dat_access={self._site_access_cookie()}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{secure_flag}",
+        )
+        self.end_headers()
+        self.wfile.write(body)
 
     def _start_ndjson_stream(self):
         """Send NDJSON response headers and return a send_event callable."""
@@ -339,6 +427,11 @@ class AuditHandler(BaseHTTPRequestHandler):
         url = data.get("url", "").strip()
         if not url:
             self._send_json({"success": False, "error": "url is required"}, 400)
+            return
+        try:
+            url = validate_public_url(url)
+        except ValueError as exc:
+            self._send_json({"success": False, "error": str(exc)}, 400)
             return
 
         model = data.get("model", "claude-haiku-4-5-20251001")
@@ -569,6 +662,107 @@ class AuditHandler(BaseHTTPRequestHandler):
                 )
         except Exception as exc:
             self._send_json({"valid": False, "error": str(exc)})
+
+    def _read_json_body(self) -> dict:
+        """Read and parse one bounded JSON request body."""
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > 64 * 1024:
+            raise ValueError("A JSON request body is required")
+        try:
+            value = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid JSON body") from exc
+        if not isinstance(value, dict):
+            raise ValueError("JSON body must be an object")
+        return value
+
+    def _handle_health(self):
+        """Return non-secret service health and async feature readiness."""
+        coordinator = get_coordinator()
+        self._send_json(
+            {
+                "status": "ok",
+                "service": "vision-aid-dat",
+                "async_site_audit_configured": coordinator.configured,
+                "async_model": coordinator.model,
+                "max_site_pages": 200,
+            }
+        )
+
+    def _handle_create_site_audit(self):
+        """Create a durable whole-site audit and return immediately."""
+        try:
+            data = self._read_json_body()
+            job = get_coordinator().create_job(
+                base_url=data.get("url", ""),
+                email=data.get("email", ""),
+            )
+        except ValueError as exc:
+            self._send_json({"success": False, "error": str(exc)}, 400)
+            return
+        except Exception as exc:
+            print(f"  Site audit creation failed: {exc}")
+            self._send_json(
+                {"success": False, "error": "Could not queue the site audit"}, 503
+            )
+            return
+        self._send_json({"success": True, "job": job}, 202)
+
+    def _handle_site_audit_status(self, path: str):
+        job_id = path.rstrip("/").rsplit("/", 1)[-1]
+        coordinator = get_coordinator()
+        job = coordinator.get_job(job_id)
+        if not job:
+            self._send_json({"success": False, "error": "Job not found"}, 404)
+            return
+        self._send_json({"success": True, "job": coordinator.public_job(job)})
+
+    def _handle_site_audit_report(self, path: str):
+        job_id = path.split("/")[-2]
+        report = get_coordinator().report_bytes(job_id)
+        if report is None:
+            self._send_json({"success": False, "error": "Report is not ready"}, 404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header(
+            "Content-Disposition", 'attachment; filename="DAT-whole-site-report.zip"'
+        )
+        self.send_header("Content-Length", str(len(report)))
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(report)
+
+    def _handle_internal_site_audit(self, operation: str):
+        """Handle authenticated callbacks from the dedicated Cloud Tasks queue."""
+        coordinator = get_coordinator()
+        supplied_token = self.headers.get("X-DAT-Job-Token", "")
+        if not coordinator.internal_token_valid(supplied_token):
+            self._send_json({"success": False, "error": "Not found"}, 404)
+            return
+        try:
+            data = self._read_json_body()
+            job_id = data.get("job_id", "")
+            if operation == "discover":
+                result = coordinator.run_discovery(job_id)
+            elif operation == "page":
+                retry_count = int(self.headers.get("X-CloudTasks-TaskRetryCount", "0"))
+                result = coordinator.run_page(
+                    job_id=job_id,
+                    page_id=data.get("page_id", ""),
+                    retry_count=retry_count,
+                    audit_callable=run_audit,
+                )
+            else:
+                result = coordinator.finalize(job_id)
+        except ValueError as exc:
+            self._send_json({"success": False, "error": str(exc)}, 400)
+            return
+        except Exception as exc:
+            print(f"  Internal site audit {operation} failed: {exc}")
+            self._send_json({"success": False, "error": "Task failed; retrying"}, 500)
+            return
+        self._send_json({"success": True, "result": result})
 
     def _send_json(self, obj: dict, status: int = 200):
         body = json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8")

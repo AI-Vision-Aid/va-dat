@@ -176,19 +176,30 @@ class OpenAIAuditClient:
         """
         filled = prompt_text.replace("{payload}", json.dumps(payload, separators=(",", ":")))
 
-        response = self._client.chat.completions.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            messages=[{"role": "user", "content": filled}],
-        )
-
-        usage = {
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-        }
-
-        raw = response.choices[0].message.content.strip()
+        if self.model.startswith("gpt-5"):
+            response = self._client.responses.create(
+                model=self.model,
+                input=filled,
+                max_output_tokens=self.max_tokens,
+                reasoning={"effort": "low"},
+            )
+            usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            }
+            raw = response.output_text.strip()
+        else:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+                messages=[{"role": "user", "content": filled}],
+            )
+            usage = {
+                "input_tokens": response.usage.prompt_tokens,
+                "output_tokens": response.usage.completion_tokens,
+            }
+            raw = response.choices[0].message.content.strip()
 
         # Strip markdown code fences if present
         if raw.startswith("```"):

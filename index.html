@@ -327,6 +327,10 @@
                   <input type="radio" name="auditMode" value="url-nested" />
                   <span>URL &#8212; With Crawl</span>
                 </label>
+                <label class="audit-mode-tab">
+                  <input type="radio" name="auditMode" value="site" />
+                  <span>Entire Site &#8212; Email Report</span>
+                </label>
               </div>
             </div>
 
@@ -465,7 +469,23 @@
               </div>
             </div>
 
-            <div class="form-row">
+            <div id="siteEmailSection" hidden>
+              <div class="form-group">
+                <label for="siteEmailInput">Report email
+                  <span class="required-mark" aria-hidden="true">*</span>
+                  <span class="sr-only">(required)</span>
+                </label>
+                <input type="email" id="siteEmailInput" name="email"
+                  placeholder="name@visionaid.org" autocomplete="email"
+                  aria-describedby="siteEmailHint siteEmailError" />
+                <p class="field-hint" id="siteEmailHint">
+                  You may close this page after submission. The printable report and CSV will be emailed when the crawl finishes.
+                </p>
+                <p class="form-error" id="siteEmailError" role="alert" aria-live="assertive" hidden></p>
+              </div>
+            </div>
+
+            <div class="form-row" id="modelKeySection">
               <div class="form-group">
                 <label for="apiKeyInput"
                   ><span id="apiKeyLabel">Anthropic API Key</span>
@@ -561,6 +581,9 @@
                     </option>
                   </optgroup>
                   <optgroup label="OpenAI">
+                    <option value="gpt-5.6-sol">
+                      GPT-5.6 Sol — flagship reasoning
+                    </option>
                     <option value="gpt-4o-mini">
                       GPT-4o mini — faster, cheaper
                     </option>
@@ -758,12 +781,24 @@
       // Input mode switching
       const htmlInputSection = document.getElementById("htmlInputSection");
       const urlInputSection = document.getElementById("urlInputSection");
+      const siteEmailSection = document.getElementById("siteEmailSection");
+      const modelKeySection = document.getElementById("modelKeySection");
+      const urlInputHint = document.getElementById("urlInputHint");
 
       document.querySelectorAll('input[name="auditMode"]').forEach((radio) => {
         radio.addEventListener("change", () => {
           const isHtml = radio.value === "html";
+          const isSite = radio.value === "site";
           htmlInputSection.hidden = !isHtml;
           urlInputSection.hidden = isHtml;
+          siteEmailSection.hidden = !isSite;
+          modelKeySection.hidden = isSite;
+          document.getElementById("auditSubmitBtn").textContent = isSite
+            ? "Queue Whole-Site Audit"
+            : "Run Audit";
+          urlInputHint.innerHTML = isSite
+            ? "The crawler uses sitemaps, internal links, and GPT-5.6 Sol to identify and audit up to 200 public pages."
+            : "The server fetches and audits this page. <em>URL — With Crawl</em> also follows in-domain links up to one level deep (max&nbsp;10 links per page).";
         });
       });
 
@@ -868,9 +903,14 @@
                 e.preventDefault();
                 clearError();
                 const _urlErr = document.getElementById("urlError");
+                const _emailErr = document.getElementById("siteEmailError");
                 if (_urlErr) {
                   _urlErr.hidden = true;
                   _urlErr.textContent = "";
+                }
+                if (_emailErr) {
+                  _emailErr.hidden = true;
+                  _emailErr.textContent = "";
                 }
 
                 const mode = getAuditMode();
@@ -910,11 +950,24 @@
                     document.getElementById("urlInput").focus();
                     return;
                   }
-                  endpoint =
-                          mode === "url-nested"
-                                  ? "/api/audit/url/nested"
-                                  : "/api/audit/url";
-                  requestBody = { url: urlVal, [keyField]: keyValue, model };
+                  if (mode === "site") {
+                    const email = document.getElementById("siteEmailInput").value.trim();
+                    if (!email) {
+                      _emailErr.textContent =
+                        "Please enter the email address that should receive the report.";
+                      _emailErr.hidden = false;
+                      document.getElementById("siteEmailInput").focus();
+                      return;
+                    }
+                    endpoint = "/api/site-audits";
+                    requestBody = { url: urlVal, email };
+                  } else {
+                    endpoint =
+                            mode === "url-nested"
+                                    ? "/api/audit/url/nested"
+                                    : "/api/audit/url";
+                    requestBody = { url: urlVal, [keyField]: keyValue, model };
+                  }
                 }
 
                 const submitBtn = document.getElementById("auditSubmitBtn");
@@ -930,7 +983,10 @@
 
                 // Show progress bar for all audit modes
                 const isNested = mode === "url-nested";
-                const initialMsg = isNested ? "Crawling pages\u2026" : "Starting audit\u2026";
+                const isAsyncSite = mode === "site";
+                const initialMsg = isAsyncSite
+                  ? "Queueing whole-site audit\u2026"
+                  : (isNested ? "Crawling pages\u2026" : "Starting audit\u2026");
                 resultsSection.style.display = "block";
 
                 // Set up the UI for the wait
@@ -967,6 +1023,19 @@
                   if (!res.ok) {
                     const errorText = await res.text();
                     throw new Error(`Server Error: ${res.status} - ${errorText}`);
+                  }
+
+                  if (isAsyncSite) {
+                    clearInterval(progressInterval);
+                    const queued = await res.json();
+                    if (!queued.success || !queued.job) {
+                      throw new Error(queued.error || "The audit could not be queued.");
+                    }
+                    renderSiteJob(content, queued.job);
+                    pollSiteJob(content, queued.job.job_id);
+                    document.getElementById("auditStatus").textContent =
+                      "Whole-site audit queued. The report will be emailed when ready.";
+                    return;
                   }
 
                   // The server (entry_points/api_server.py) answers audits with
@@ -1020,9 +1089,55 @@
                   resultsSection.style.display = "block";
                 } finally {
                   submitBtn.disabled = false;
-                  submitBtn.textContent = "Run Audit";
+                  submitBtn.textContent = getAuditMode() === "site"
+                    ? "Queue Whole-Site Audit"
+                    : "Run Audit";
                 }
               });
+
+      function renderSiteJob(container, job) {
+        const finished = (job.pages_completed || 0) + (job.pages_failed || 0);
+        const total = job.pages_total || 0;
+        const pct = job.progress_percent || 0;
+        const labels = {
+          queued: "Queued",
+          discovering: "Discovering site pages",
+          auditing: "Auditing pages",
+          finalizing: "Building and emailing report",
+          complete: "Complete",
+          enqueue_failed: "Could not queue audit",
+        };
+        const reportLink = job.report_url
+          ? `<p><a class="download-btn" href="${esc(job.report_url)}">Download report ZIP</a></p>`
+          : "";
+        container.innerHTML = `
+          <div class="audit-progress">
+            <p class="progress-message"><strong>${esc(labels[job.status] || job.status)}</strong></p>
+            <div class="progress-bar-track"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
+            <p class="progress-detail">${total ? `${finished} of ${total} pages finished` : "Finding public pages\u2026"}</p>
+          </div>
+          <p>You may close this page. The report will be emailed when complete.</p>
+          ${job.capped ? "<p class=\"audit-notice\">The site exceeded the limit; the audit is capped at 200 pages.</p>" : ""}
+          ${job.email_sent ? "<p><strong>Email sent.</strong></p>" : ""}
+          ${job.last_error ? `<p class="audit-error">${esc(job.last_error)}</p>` : ""}
+          ${reportLink}`;
+      }
+
+      async function pollSiteJob(container, jobId) {
+        for (;;) {
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+          try {
+            const res = await fetch(`/api/site-audits/${encodeURIComponent(jobId)}`);
+            if (!res.ok) return;
+            const data = await res.json();
+            if (!data.success) return;
+            renderSiteJob(container, data.job);
+            if (["complete", "enqueue_failed"].includes(data.job.status)) return;
+          } catch {
+            return;
+          }
+        }
+      }
 
       // Approximate completion percentage for each named pipeline stage.
       // Per-prompt and per-page events are interpolated between these.

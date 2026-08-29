@@ -53,6 +53,9 @@ jobs:
           print('all entry points import cleanly')
           "
 
+      - name: Unit tests
+        run: uv run python -m unittest discover -v
+
       # Exercises extractors, slicers, prompt templates and the programmatic
       # checkers end to end. --dry-run makes no API calls, so this needs no key
       # and costs nothing.

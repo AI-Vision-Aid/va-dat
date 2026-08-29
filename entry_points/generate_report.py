@@ -871,13 +871,22 @@ def deduplicate_with_llm(
         if is_openai:
             import openai
             client = openai.OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model=model,
-                max_tokens=512,
-                temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            response_text = response.choices[0].message.content or "[]"
+            if model.startswith("gpt-5"):
+                response = client.responses.create(
+                    model=model,
+                    input=prompt,
+                    max_output_tokens=512,
+                    reasoning={"effort": "low"},
+                )
+                response_text = response.output_text or "[]"
+            else:
+                response = client.chat.completions.create(
+                    model=model,
+                    max_tokens=512,
+                    temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                response_text = response.choices[0].message.content or "[]"
         else:
             import anthropic
             from processing_scripts.llm_client.client import supports_temperature
