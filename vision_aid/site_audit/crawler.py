@@ -219,6 +219,7 @@ def _browser_fetch(
     accepted_types: tuple[str, ...],
 ) -> tuple[str, str, str]:
     """Solve JavaScript interstitials in Chromium while preserving SSRF checks."""
+    from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
 
     original = validate_public_url(url)
@@ -256,11 +257,22 @@ def _browser_fetch(
                 timeout=timeout * 1_000,
             )
             deadline = time.monotonic() + min(25, timeout)
-            while _looks_like_bot_challenge(page.content(), page.url):
+            while True:
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
                         "The site's browser security challenge could not be completed"
                     )
+                try:
+                    current_body = page.content()
+                    current_url = page.url
+                except PlaywrightError:
+                    # A successful interstitial may replace itself while this
+                    # loop is sampling the DOM. Let navigation settle instead
+                    # of treating that normal transition as a page failure.
+                    page.wait_for_timeout(250)
+                    continue
+                if not _looks_like_bot_challenge(current_body, current_url):
+                    break
                 page.wait_for_timeout(1_000)
 
             # Reload after the challenge so ``response.body()`` is the actual
