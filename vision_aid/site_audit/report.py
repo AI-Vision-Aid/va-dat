@@ -22,6 +22,10 @@ class SiteReport:
     total_findings: int
     pages_succeeded: int
     pages_failed: int
+    total_input_tokens: int
+    total_output_tokens: int
+    total_tokens: int
+    estimated_cost_usd: float
 
 
 def _csv_rows(csv_text: str | None, page_url: str) -> list[dict[str, str]]:
@@ -154,6 +158,74 @@ def _render_csv(all_rows: list[dict[str, str]]) -> bytes:
     return output.getvalue().encode("utf-8-sig")
 
 
+def _render_usage_report(
+    *,
+    base_url: str,
+    model: str,
+    page_results: list[dict],
+) -> tuple[bytes, dict]:
+    """Build a standalone human-readable token and estimated-cost report."""
+    usage_rows = []
+    total_input = 0
+    total_output = 0
+    total_cost = 0.0
+    for result in page_results:
+        summary = result.get("summary") or {}
+        input_tokens = int(summary.get("total_input_tokens") or 0)
+        output_tokens = int(summary.get("total_output_tokens") or 0)
+        estimated_cost = float(summary.get("estimated_cost_usd") or 0.0)
+        total_input += input_tokens
+        total_output += output_tokens
+        total_cost += estimated_cost
+        usage_rows.append(
+            {
+                "url": str(result.get("page_url") or ""),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "estimated_cost_usd": estimated_cost,
+            }
+        )
+
+    rows_html = "".join(
+        "<tr>"
+        f"<td><a href=\"{html.escape(row['url'])}\">{html.escape(row['url'])}</a></td>"
+        f"<td>{row['input_tokens']:,}</td><td>{row['output_tokens']:,}</td>"
+        f"<td>{row['total_tokens']:,}</td>"
+        f"<td>${row['estimated_cost_usd']:,.6f}</td></tr>"
+        for row in usage_rows
+    ) or '<tr><td colspan="5">No model usage was recorded.</td></tr>'
+    total_tokens = total_input + total_output
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DAT token and cost report</title><style>
+body{{font-family:Arial,sans-serif;color:#172033;line-height:1.5;max-width:1100px;margin:auto;padding:32px}}
+h1{{color:#183f7a}}.metrics{{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:12px;margin:24px 0}}
+.metric{{border:2px solid #dce6f4;border-radius:8px;padding:16px}}.metric strong{{display:block;font-size:1.55rem}}
+table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #bac7d8;padding:8px;text-align:left;vertical-align:top}}
+th{{background:#eef4fb}}a{{color:#0b5cab;overflow-wrap:anywhere}}@media(max-width:700px){{.metrics{{grid-template-columns:1fr 1fr}}}}
+</style></head><body><main><h1>Token and Estimated Cost Report</h1>
+<p><strong>Site:</strong> {html.escape(base_url)}<br><strong>Model:</strong> {html.escape(model)}<br>
+<strong>Generated:</strong> {generated}</p>
+<div class="metrics"><div class="metric"><strong>{total_input:,}</strong>Input tokens</div>
+<div class="metric"><strong>{total_output:,}</strong>Output tokens</div>
+<div class="metric"><strong>{total_tokens:,}</strong>Total tokens</div>
+<div class="metric"><strong>${total_cost:,.6f}</strong>Estimated cost</div></div>
+<p>Costs are estimates calculated by the DAT pipeline from the recorded model usage for each completed page.</p>
+<h2>Page-by-page usage</h2><table><thead><tr><th>Page</th><th>Input tokens</th>
+<th>Output tokens</th><th>Total tokens</th><th>Estimated cost (USD)</th></tr></thead>
+<tbody>{rows_html}</tbody></table></main></body></html>"""
+    totals = {
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_tokens": total_tokens,
+        "estimated_cost_usd": round(total_cost, 8),
+        "pages": usage_rows,
+    }
+    return document.encode("utf-8"), totals
+
+
 def build_site_report(
     *,
     base_url: str,
@@ -188,6 +260,11 @@ def build_site_report(
         all_rows=all_rows,
     )
     csv_bytes = _render_csv(all_rows)
+    usage_html, usage = _render_usage_report(
+        base_url=base_url,
+        model=model,
+        page_results=page_results,
+    )
     summary_json = json.dumps(
         {
             "base_url": base_url,
@@ -198,6 +275,7 @@ def build_site_report(
             "candidate_count": candidate_count,
             "capped": capped,
             "total_findings": len(all_rows),
+            "usage": usage,
             "pages": [
                 {
                     "url": page.get("url"),
@@ -217,6 +295,7 @@ def build_site_report(
         archive.writestr("DAT-whole-site-report.html", html_bytes)
         archive.writestr("DAT-findings.csv", csv_bytes)
         archive.writestr("DAT-summary.json", summary_json)
+        archive.writestr("DAT-token-and-cost-report.html", usage_html)
 
     return SiteReport(
         html_bytes=html_bytes,
@@ -225,4 +304,8 @@ def build_site_report(
         total_findings=len(all_rows),
         pages_succeeded=sum(1 for page in normalized_pages if page.get("status") == "complete"),
         pages_failed=sum(1 for page in normalized_pages if page.get("status") == "failed"),
+        total_input_tokens=usage["total_input_tokens"],
+        total_output_tokens=usage["total_output_tokens"],
+        total_tokens=usage["total_tokens"],
+        estimated_cost_usd=usage["estimated_cost_usd"],
     )

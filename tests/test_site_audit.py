@@ -337,18 +337,36 @@ class ReportTests(unittest.TestCase):
             candidate_count=1,
             pages=[{"url": "https://www.abilitybazaar.com/", "status": "complete"}],
             page_results=[
-                {"page_url": "https://www.abilitybazaar.com/", "csv_report": csv_text}
+                {
+                    "page_url": "https://www.abilitybazaar.com/",
+                    "csv_report": csv_text,
+                    "summary": {
+                        "total_input_tokens": 1_000,
+                        "total_output_tokens": 500,
+                        "estimated_cost_usd": 0.012345,
+                    },
+                }
             ],
         )
         self.assertEqual(report.total_findings, 1)
         self.assertIn(b"Whole-Site Accessibility Audit Report", report.html_bytes)
         self.assertIn(b"Page Summary", report.html_bytes)
         self.assertIn(b"page_url", report.csv_bytes)
+        self.assertEqual(report.total_tokens, 1_500)
+        self.assertEqual(report.estimated_cost_usd, 0.012345)
         with zipfile.ZipFile(io.BytesIO(report.zip_bytes)) as archive:
             self.assertEqual(
                 set(archive.namelist()),
-                {"DAT-whole-site-report.html", "DAT-findings.csv", "DAT-summary.json"},
+                {
+                    "DAT-whole-site-report.html",
+                    "DAT-findings.csv",
+                    "DAT-summary.json",
+                    "DAT-token-and-cost-report.html",
+                },
             )
+            usage_report = archive.read("DAT-token-and-cost-report.html")
+            self.assertIn(b"1,500", usage_report)
+            self.assertIn(b"$0.012345", usage_report)
 
 
 if __name__ == "__main__":
