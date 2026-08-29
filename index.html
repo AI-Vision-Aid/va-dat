@@ -1184,6 +1184,16 @@
                 }
               });
 
+      function formatDuration(totalSeconds) {
+        const seconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+        if (seconds < 60) return `${seconds} sec`;
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `${minutes} min`;
+        const hours = Math.floor(minutes / 60);
+        const remainder = minutes % 60;
+        return remainder ? `${hours} hr ${remainder} min` : `${hours} hr`;
+      }
+
       function renderSiteJob(container, job) {
         const finished = (job.pages_completed || 0) + (job.pages_failed || 0);
         const total = job.pages_total || 0;
@@ -1199,17 +1209,68 @@
         const reportLink = job.report_url
           ? `<p><a class="download-btn" href="${esc(job.report_url)}">Download report ZIP</a></p>`
           : "";
+        const details = [];
+        if (total) {
+          details.push(`${finished} of ${total} pages processed`);
+          details.push(`${job.pages_completed || 0} successful`);
+          if (job.pages_failed) details.push(`${job.pages_failed} failed`);
+        } else if (job.status === "discovering") {
+          details.push("Checking sitemaps, site links, CMS records, and web search…");
+        } else {
+          details.push("Waiting to begin page discovery…");
+        }
+        if (job.elapsed_seconds != null) {
+          details.push(`Elapsed: ${formatDuration(job.elapsed_seconds)}`);
+        }
+        if (job.estimated_seconds_remaining > 0) {
+          details.push(`Estimated remaining: ${formatDuration(job.estimated_seconds_remaining)}`);
+        }
+        if (job.candidate_count) {
+          details.push(`${job.candidate_count} public page candidates found`);
+        }
+        const deliveryNotice = job.email_delivery_status === "accepted"
+          ? `<p><strong>Email submitted successfully.</strong> The mail server accepted it${job.email_accepted_at ? ` at ${esc(new Date(job.email_accepted_at).toLocaleString())}` : ""}.</p>`
+          : "";
+        const resendButton = job.report_url
+          ? `<p><button class="download-btn resend-report-btn" type="button">Resend report email</button></p>`
+          : "";
         container.innerHTML = `
           <div class="audit-progress">
-            <p class="progress-message"><strong>${esc(labels[job.status] || job.status)}</strong></p>
-            <div class="progress-bar-track"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
-            <p class="progress-detail">${total ? `${finished} of ${total} pages finished` : "Finding public pages\u2026"}</p>
+            <p class="progress-message"><strong>${esc(labels[job.status] || job.status)}</strong> — ${pct}%</p>
+            <div class="progress-bar-track" role="progressbar" aria-label="Whole-site audit progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
+            <p class="progress-detail">${details.map(esc).join(" • ")}</p>
           </div>
           <p>You may close this page. The report will be emailed when complete.</p>
           ${job.capped ? "<p class=\"audit-notice\">The site exceeded the limit; the audit is capped at 200 pages.</p>" : ""}
-          ${job.email_sent ? "<p><strong>Email sent.</strong></p>" : ""}
+          ${deliveryNotice}
           ${job.last_error ? `<p class="audit-error">${esc(job.last_error)}</p>` : ""}
-          ${reportLink}`;
+          ${reportLink}
+          ${resendButton}`;
+        const resend = container.querySelector(".resend-report-btn");
+        if (resend) {
+          resend.addEventListener("click", async () => {
+            resend.disabled = true;
+            resend.textContent = "Submitting email…";
+            try {
+              const response = await fetch(
+                `/api/site-audits/${encodeURIComponent(job.job_id)}/resend`,
+                { method: "POST" }
+              );
+              const result = await response.json();
+              if (!response.ok || !result.success) {
+                throw new Error(result.error || "Email resend failed");
+              }
+              renderSiteJob(container, result.job);
+            } catch (error) {
+              resend.disabled = false;
+              resend.textContent = "Resend report email";
+              const notice = document.createElement("p");
+              notice.className = "audit-error";
+              notice.textContent = error.message;
+              resend.parentElement.after(notice);
+            }
+          });
+        }
       }
 
       async function pollSiteJob(container, jobId) {

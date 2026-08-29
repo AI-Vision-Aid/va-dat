@@ -304,6 +304,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._handle_validate_key()
         elif self.path == "/api/site-audits":
             self._handle_create_site_audit()
+        elif re.fullmatch(r"/api/site-audits/[A-Za-z0-9_-]+/resend", self.path):
+            self._handle_site_audit_resend(self.path)
         else:
             self.send_error(404, "Not Found")
 
@@ -736,6 +738,22 @@ class AuditHandler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
         self.wfile.write(report)
+
+    def _handle_site_audit_resend(self, path: str):
+        job_id = path.split("/")[-2]
+        try:
+            job = get_coordinator().resend_report(job_id)
+        except ValueError as exc:
+            self._send_json({"success": False, "error": str(exc)}, 400)
+            return
+        except Exception as exc:
+            print(f"  Site audit email resend failed: {exc}")
+            self._send_json(
+                {"success": False, "error": "The mail server did not accept the resend"},
+                503,
+            )
+            return
+        self._send_json({"success": True, "job": job})
 
     def _handle_internal_site_audit(self, operation: str):
         """Handle authenticated callbacks from the dedicated Cloud Tasks queue."""

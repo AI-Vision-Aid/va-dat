@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from email.utils import format_datetime, make_msgid
 from typing import Callable
 from urllib.parse import quote, urlparse
 
@@ -153,8 +154,8 @@ def send_report_email(
     findings: int,
     download_url: str,
     report_zip: bytes,
-) -> None:
-    """Send the completed site report using deployment SMTP settings."""
+) -> dict:
+    """Submit a completed report to SMTP and return its acceptance receipt."""
     smtp_host = os.getenv("SMTP_HOST", "").strip()
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_user = os.getenv("SMTP_USER", "").strip()
@@ -168,14 +169,23 @@ def send_report_email(
     message["Subject"] = f"DAT whole-site accessibility report: {host}"
     message["From"] = smtp_from
     message["To"] = recipient
+    message["Date"] = format_datetime(_now())
+    message_id = make_msgid(domain=(smtp_from.rsplit("@", 1)[-1] or None))
+    message["Message-ID"] = message_id
+    attach_report = os.getenv("DAT_EMAIL_ATTACH_REPORT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     message.set_content(
         "Your Vision Aid DAT whole-site accessibility report is ready.\n\n"
         f"Site: {base_url}\nPages processed: {pages}\nFindings: {findings}\n"
         f"Download: {download_url}\n\n"
-        "The attached ZIP contains a printable HTML report, a CSV findings file, "
-        "and a JSON page summary."
+        "For reliable delivery, the report is provided through the secure download "
+        "link instead of as an email attachment. Sign in with the DAT testing "
+        "password if prompted."
     )
-    if len(report_zip) <= 18 * 1024 * 1024:
+    if attach_report and len(report_zip) <= 18 * 1024 * 1024:
         message.add_attachment(
             report_zip,
             maintype="application",
@@ -188,7 +198,22 @@ def send_report_email(
         smtp.starttls()
         smtp.ehlo()
         smtp.login(smtp_user, smtp_password)
-        smtp.send_message(message)
+        refused = smtp.send_message(
+            message,
+            from_addr=smtp_from,
+            to_addrs=[recipient],
+        )
+    if refused:
+        refused_recipients = ", ".join(str(item) for item in refused)
+        raise RuntimeError(f"Mail server refused: {refused_recipients}")
+    accepted_at = _now()
+    return {
+        "message_id": message_id,
+        "accepted_at": accepted_at,
+        "recipient": recipient,
+        "smtp_host": smtp_host,
+        "attachment_included": attach_report and len(report_zip) <= 18 * 1024 * 1024,
+    }
 
 
 class SiteAuditCoordinator:
@@ -427,17 +452,48 @@ class SiteAuditCoordinator:
                 "pages_completed",
                 "pages_failed",
                 "candidate_count",
+                "discovery_sources",
                 "capped",
                 "total_findings",
                 "report_ready",
                 "email_sent",
+                "email_delivery_status",
+                "email_accepted_at",
                 "last_error",
+                "created_at",
+                "audit_started_at",
+                "completed_at",
             )
             if key in job
         }
         total = int(job.get("pages_total") or 0)
         finished = int(job.get("pages_completed") or 0) + int(job.get("pages_failed") or 0)
-        result["progress_percent"] = round((finished / total) * 100) if total else 0
+        remaining = max(0, total - finished)
+        status = str(job.get("status", ""))
+        if status == "complete":
+            progress = 100
+        elif status == "finalizing":
+            progress = 98
+        elif total:
+            progress = min(97, round((finished / total) * 97))
+        elif status == "discovering":
+            progress = 2
+        else:
+            progress = 0
+        result["progress_percent"] = progress
+        result["pages_remaining"] = remaining
+
+        started_at = job.get("audit_started_at") or job.get("created_at")
+        ended_at = job.get("completed_at") if status == "complete" else _now()
+        if isinstance(started_at, datetime) and isinstance(ended_at, datetime):
+            elapsed = max(0, int((ended_at - started_at).total_seconds()))
+            result["elapsed_seconds"] = elapsed
+            if status == "auditing" and finished > 0 and remaining > 0:
+                result["estimated_seconds_remaining"] = max(
+                    1, round((elapsed / finished) * remaining)
+                )
+            elif status in {"finalizing", "complete"}:
+                result["estimated_seconds_remaining"] = 0
         if job.get("status") == "complete":
             result["report_url"] = f"{self.service_url}/api/site-audits/{job['job_id']}/report"
         for key, value in list(result.items()):
@@ -456,7 +512,13 @@ class SiteAuditCoordinator:
 
         existing_pages = list(job_ref.collection("pages").stream())
         if not existing_pages:
-            job_ref.update({"status": "discovering", "updated_at": _now()})
+            job_ref.update(
+                {
+                    "status": "discovering",
+                    "discovery_started_at": _now(),
+                    "updated_at": _now(),
+                }
+            )
             discovery = discover_site_urls(
                 job["base_url"],
                 api_key=self._job_api_key(job),
@@ -484,7 +546,9 @@ class SiteAuditCoordinator:
                     "candidate_count": discovery.candidate_count,
                     "capped": discovery.capped,
                     "ai_discovery_used": discovery.ai_used,
+                    "ai_web_discovery_used": discovery.ai_web_used,
                     "sitemap_count": discovery.sitemap_count,
+                    "discovery_sources": discovery.source_counts,
                     "updated_at": _now(),
                 }
             )
@@ -498,7 +562,11 @@ class SiteAuditCoordinator:
                 {"job_id": job_id, "page_id": snapshot.id},
                 f"{job_id}-page-{index:03d}",
             )
-        job_ref.update({"status": "auditing", "updated_at": _now()})
+        refreshed_job = self.get_job(job_id) or {}
+        audit_update = {"status": "auditing", "updated_at": _now()}
+        if not refreshed_job.get("audit_started_at"):
+            audit_update["audit_started_at"] = _now()
+        job_ref.update(audit_update)
         return self.public_job(self.get_job(job_id))
 
     def _store_page_result(self, job_id: str, page_id: str, payload: dict) -> str:
@@ -556,6 +624,7 @@ class SiteAuditCoordinator:
                 "pages_completed": completed,
                 "pages_failed": failed,
                 "updated_at": _now(),
+                "last_page_completed_at": _now(),
             }
             ready = completed + failed >= int(job.get("pages_total", 0))
             if ready:
@@ -693,7 +762,7 @@ class SiteAuditCoordinator:
                 }
             )
         try:
-            send_report_email(
+            delivery = send_report_email(
                 recipient=job["email"],
                 base_url=job["base_url"],
                 pages=len(pages),
@@ -714,7 +783,42 @@ class SiteAuditCoordinator:
                 "report_objects": objects,
                 "total_findings": report.total_findings,
                 "email_sent": True,
+                "email_delivery_status": "accepted",
+                "email_message_id": delivery["message_id"],
+                "email_accepted_at": delivery["accepted_at"],
+                "email_attachment_included": delivery["attachment_included"],
                 "completed_at": _now(),
+                "updated_at": _now(),
+                "last_error": firestore.DELETE_FIELD,
+            }
+        )
+        return self.public_job(self.get_job(job_id))
+
+    def resend_report(self, job_id: str) -> dict:
+        """Resubmit an existing completed report without rerunning the audit."""
+        job_ref = self._job_ref(job_id)
+        job = self.get_job(job_id)
+        if not job or not job.get("report_ready"):
+            raise ValueError("The report is not ready to resend")
+        report_zip = self.report_bytes(job_id)
+        if report_zip is None:
+            raise ValueError("The report file is unavailable")
+        delivery = send_report_email(
+            recipient=job["email"],
+            base_url=job["base_url"],
+            pages=int(job.get("pages_total", 0)),
+            findings=int(job.get("total_findings", 0)),
+            download_url=f"{self.service_url}/api/site-audits/{job_id}/report",
+            report_zip=report_zip,
+        )
+        job_ref.update(
+            {
+                "email_sent": True,
+                "email_delivery_status": "accepted",
+                "email_message_id": delivery["message_id"],
+                "email_accepted_at": delivery["accepted_at"],
+                "email_attachment_included": delivery["attachment_included"],
+                "email_resend_count": firestore.Increment(1),
                 "updated_at": _now(),
                 "last_error": firestore.DELETE_FIELD,
             }

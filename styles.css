@@ -1445,7 +1445,8 @@ section:nth-child(even) {
 .progress-detail {
   font-size: 0.85rem;
   color: #666;
-  word-break: break-all;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 
 /* ============================================

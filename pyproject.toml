@@ -20,6 +20,7 @@ dependencies = [
     "google-cloud-tasks>=2.19.0",
     "python-dotenv~=1.2.1",
     "requests>=2.32.2",
+    "curl-cffi>=0.14.0",
 ]
 
 [tool.setuptools]

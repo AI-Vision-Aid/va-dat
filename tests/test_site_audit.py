@@ -7,6 +7,7 @@ import json
 import os
 import unittest
 import zipfile
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 from cryptography.fernet import Fernet
@@ -18,9 +19,14 @@ from vision_aid.site_audit.crawler import (
     _is_candidate_url,
     _sitemap_locations,
     canonicalize_url,
+    fetch_public_html,
     validate_public_url,
 )
-from vision_aid.site_audit.jobs import SiteAuditCoordinator, validate_request_email
+from vision_aid.site_audit.jobs import (
+    SiteAuditCoordinator,
+    send_report_email,
+    validate_request_email,
+)
 from vision_aid.site_audit.report import build_site_report
 
 
@@ -119,6 +125,30 @@ class CrawlerSafetyTests(unittest.TestCase):
         self.assertEqual(ordered[0].url, "https://example.com/about/")
         self.assertEqual({item.url for item in ordered}, {item.url for item in candidates})
 
+    def test_browser_fingerprint_fallback_is_used_when_standard_request_is_blocked(self):
+        blocked = mock.Mock(status_code=403)
+        blocked.close = mock.Mock()
+        session = mock.Mock()
+        session.get.return_value = blocked
+        browser_response = mock.Mock(
+            status_code=200,
+            is_redirect=False,
+            is_permanent_redirect=False,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            encoding="utf-8",
+        )
+        browser_response.iter_content.return_value = [b"<html>working</html>"]
+        browser_response.raise_for_status.return_value = None
+        with mock.patch(
+            "curl_cffi.requests.get", return_value=browser_response
+        ) as browser_get:
+            html, final_url = fetch_public_html(
+                "https://example.com/", session=session
+            )
+        self.assertEqual(html, "<html>working</html>")
+        self.assertEqual(final_url, "https://example.com/")
+        browser_get.assert_called_once()
+
 
 class EmailTests(unittest.TestCase):
     def test_allowed_domain(self):
@@ -130,6 +160,65 @@ class EmailTests(unittest.TestCase):
     def test_disallowed_domain(self):
         with self.assertRaisesRegex(ValueError, "limited"):
             validate_request_email("person@example.com", {"visionaid.org"})
+
+    def test_email_records_smtp_acceptance_and_omits_zip_by_default(self):
+        smtp = mock.Mock()
+        smtp.send_message.return_value = {}
+        smtp_context = mock.Mock()
+        smtp_context.__enter__ = mock.Mock(return_value=smtp)
+        smtp_context.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SMTP_HOST": "smtp.example.com",
+                "SMTP_PORT": "587",
+                "SMTP_USER": "sender@example.com",
+                "SMTP_PASSWORD": "secret",
+                "SMTP_FROM": "sender@example.com",
+                "DAT_EMAIL_ATTACH_REPORT": "false",
+            },
+        ), mock.patch(
+            "vision_aid.site_audit.jobs.smtplib.SMTP", return_value=smtp_context
+        ):
+            receipt = send_report_email(
+                recipient="recipient@example.com",
+                base_url="https://example.com/",
+                pages=3,
+                findings=7,
+                download_url="https://dat.example.com/report",
+                report_zip=b"zip",
+            )
+        message = smtp.send_message.call_args.args[0]
+        self.assertEqual(list(message.iter_attachments()), [])
+        self.assertEqual(receipt["recipient"], "recipient@example.com")
+        self.assertFalse(receipt["attachment_included"])
+        self.assertTrue(receipt["message_id"].startswith("<"))
+
+    def test_email_raises_when_recipient_is_refused(self):
+        smtp = mock.Mock()
+        smtp.send_message.return_value = {"recipient@example.com": (550, b"refused")}
+        smtp_context = mock.Mock()
+        smtp_context.__enter__ = mock.Mock(return_value=smtp)
+        smtp_context.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SMTP_HOST": "smtp.example.com",
+                "SMTP_USER": "sender@example.com",
+                "SMTP_PASSWORD": "secret",
+                "SMTP_FROM": "sender@example.com",
+            },
+        ), mock.patch(
+            "vision_aid.site_audit.jobs.smtplib.SMTP", return_value=smtp_context
+        ), self.assertRaisesRegex(RuntimeError, "refused"):
+            send_report_email(
+                recipient="recipient@example.com",
+                base_url="https://example.com/",
+                pages=1,
+                findings=0,
+                download_url="https://dat.example.com/report",
+                report_zip=b"zip",
+            )
 
 
 class CredentialTests(unittest.TestCase):
@@ -174,6 +263,28 @@ class CredentialTests(unittest.TestCase):
         self.assertTrue(config["api_key_verified"])
         self.assertEqual(config["api_key_masked"], "••••••••••••••••")
         self.assertNotIn("saved-test-credential", repr(config))
+
+
+class ProgressTests(unittest.TestCase):
+    def test_public_job_reports_percentage_elapsed_time_and_eta(self):
+        now = datetime(2026, 8, 29, 18, 0, tzinfo=timezone.utc)
+        coordinator = SiteAuditCoordinator()
+        coordinator.service_url = "https://dat.example.com"
+        job = {
+            "job_id": "test-job",
+            "status": "auditing",
+            "pages_total": 10,
+            "pages_completed": 4,
+            "pages_failed": 0,
+            "created_at": now - timedelta(minutes=4),
+            "audit_started_at": now - timedelta(minutes=2),
+        }
+        with mock.patch("vision_aid.site_audit.jobs._now", return_value=now):
+            public = coordinator.public_job(job)
+        self.assertEqual(public["progress_percent"], 39)
+        self.assertEqual(public["pages_remaining"], 6)
+        self.assertEqual(public["elapsed_seconds"], 120)
+        self.assertEqual(public["estimated_seconds_remaining"], 180)
 
 
 class ReportTests(unittest.TestCase):

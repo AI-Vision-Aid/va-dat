@@ -130,7 +130,9 @@ class DiscoveryResult:
     candidate_count: int
     capped: bool
     ai_used: bool
+    ai_web_used: bool
     sitemap_count: int
+    source_counts: dict[str, int]
 
 
 def canonicalize_url(url: str) -> str:
@@ -202,13 +204,37 @@ def _request(
     """Fetch a public URL safely and return ``(body, final_url, content_type)``."""
     current = validate_public_url(url)
     for _ in range(6):
-        response = session.get(
-            current,
-            headers=REQUEST_HEADERS,
-            timeout=timeout,
-            allow_redirects=False,
-            stream=True,
-        )
+        try:
+            response = session.get(
+                current,
+                headers=REQUEST_HEADERS,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True,
+            )
+            if response.status_code in {403, 406, 429, 503}:
+                response.close()
+                raise requests.HTTPError(
+                    f"HTTP {response.status_code} blocked the standard crawler"
+                )
+        except (requests.RequestException, OSError) as primary_error:
+            # Some bot-protected sites reject the default Python TLS signature
+            # even when the headers identify a current browser. curl_cffi uses a
+            # real browser TLS/HTTP fingerprint while the redirect and SSRF
+            # checks below remain under our control.
+            try:
+                from curl_cffi import requests as browser_requests
+
+                response = browser_requests.get(
+                    current,
+                    headers=REQUEST_HEADERS,
+                    timeout=timeout,
+                    allow_redirects=False,
+                    impersonate="chrome",
+                    stream=True,
+                )
+            except Exception:
+                raise primary_error
         if response.is_redirect or response.is_permanent_redirect:
             location = response.headers.get("Location")
             response.close()
@@ -477,6 +503,45 @@ Candidates:
     return [candidates[index] for index in indexes]
 
 
+def _ai_web_discover_candidates(
+    base_url: str,
+    *,
+    api_key: str,
+    model: str,
+    max_pages: int,
+) -> list[str]:
+    """Use OpenAI web search only when the target blocks every direct source."""
+    if not api_key or not model.startswith(("gpt-", "o1", "o3", "o4")):
+        return []
+
+    from openai import OpenAI
+
+    host = urlparse(base_url).hostname or base_url
+    client = OpenAI(api_key=api_key, max_retries=4, timeout=180.0)
+    response = client.responses.create(
+        model=model,
+        tools=[{"type": "web_search"}],
+        reasoning={"effort": "low"},
+        max_output_tokens=12_000,
+        input=f"""Find the public HTML pages belonging to {base_url} for a complete
+accessibility audit. Search the web for indexed pages on site:{host}, inspect
+public sitemap results when available, and return up to {max_pages} canonical
+same-site URLs. Exclude files, feeds, login/admin pages, previews, search-result
+pages, and action URLs. Do not invent URLs. Return JSON only as
+{{"urls":["https://..."]}}.
+""",
+    )
+    parsed = _parse_json_object(response.output_text)
+    urls: list[str] = []
+    for value in parsed.get("urls", []):
+        candidate = canonicalize_url(str(value))
+        if _is_candidate_url(candidate, base_url) and candidate not in urls:
+            urls.append(candidate)
+            if len(urls) >= max_pages:
+                break
+    return urls
+
+
 def discover_site_urls(
     base_url: str,
     *,
@@ -500,7 +565,21 @@ def discover_site_urls(
 
     sitemap_urls, sitemap_count = _read_sitemaps(normalized_base, active_session)
     wordpress_urls = _discover_wordpress_urls(normalized_base, active_session)
-    queue = deque([normalized_base, *sitemap_urls, *wordpress_urls])
+    ai_web_urls: list[str] = []
+    ai_web_used = False
+    if len({normalized_base, *sitemap_urls, *wordpress_urls}) <= 1:
+        try:
+            ai_web_urls = _ai_web_discover_candidates(
+                normalized_base,
+                api_key=api_key,
+                model=model,
+                max_pages=max_pages,
+            )
+            ai_web_used = bool(ai_web_urls)
+        except Exception as exc:
+            print(f"  WARNING: AI web discovery failed ({exc}); continuing direct crawl")
+
+    queue = deque([normalized_base, *sitemap_urls, *wordpress_urls, *ai_web_urls])
     candidates: dict[str, PageCandidate] = {
         normalized_base: PageCandidate(normalized_base, source="base")
     }
@@ -511,6 +590,10 @@ def discover_site_urls(
     for wordpress_url in wordpress_urls:
         candidates.setdefault(
             wordpress_url, PageCandidate(wordpress_url, source="cms")
+        )
+    for ai_web_url in ai_web_urls:
+        candidates.setdefault(
+            ai_web_url, PageCandidate(ai_web_url, source="ai-web")
         )
 
     fetched: set[str] = set()
@@ -562,10 +645,15 @@ def discover_site_urls(
     if normalized_base not in {item.url for item in selected}:
         selected = [base_candidate, *selected][:max_pages]
     capped = len(ordered) > max_pages
+    source_counts: dict[str, int] = {}
+    for candidate in ordered:
+        source_counts[candidate.source] = source_counts.get(candidate.source, 0) + 1
     return DiscoveryResult(
         pages=selected[:max_pages],
         candidate_count=len(ordered),
         capped=capped,
         ai_used=ai_used,
+        ai_web_used=ai_web_used,
         sitemap_count=sitemap_count,
+        source_counts=source_counts,
     )

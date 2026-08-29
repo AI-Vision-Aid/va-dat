@@ -15,11 +15,14 @@ beautifulsoup4==4.15.0
     # via visionaid
 certifi==2026.7.22
     # via
+    #   curl-cffi
     #   httpcore
     #   httpx
     #   requests
-cffi==2.1.1 ; platform_python_implementation != 'PyPy'
-    # via cryptography
+cffi==2.1.1
+    # via
+    #   cryptography
+    #   curl-cffi
 charset-normalizer==3.4.9
     # via requests
 colorama==0.4.6 ; sys_platform == 'win32'
@@ -28,6 +31,8 @@ cryptography==50.0.0
     # via
     #   google-auth
     #   visionaid
+curl-cffi==0.16.2
+    # via visionaid
 distro==1.9.0
     # via
     #   anthropic
@@ -124,7 +129,7 @@ pyasn1==0.6.4
     # via pyasn1-modules
 pyasn1-modules==0.4.2
     # via google-auth
-pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
+pycparser==3.0 ; implementation_name != 'PyPy'
     # via cffi
 pydantic==2.13.4
     # via
