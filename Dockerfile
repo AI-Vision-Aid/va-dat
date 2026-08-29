@@ -35,7 +35,15 @@ RUN uv sync --frozen --no-dev
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    DAT_CHROMIUM_EXECUTABLE=/usr/bin/chromium
+
+# SiteGround and similar CDNs can return JavaScript security interstitials to
+# cloud data-center traffic. Chromium executes the legitimate public-site
+# challenge so the auditor receives the requested page, never the interstitial.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 # Single chowned COPY: the virtualenv lands in exactly one layer.  Copying it
 # after creating it, rather than chown -R'ing it in place, keeps the image from

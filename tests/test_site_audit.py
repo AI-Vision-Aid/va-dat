@@ -17,6 +17,7 @@ from vision_aid.site_audit.crawler import (
     _ai_order_candidates,
     _discover_wordpress_urls,
     _is_candidate_url,
+    _looks_like_bot_challenge,
     _sitemap_locations,
     canonicalize_url,
     fetch_public_html,
@@ -148,6 +149,40 @@ class CrawlerSafetyTests(unittest.TestCase):
         self.assertEqual(html, "<html>working</html>")
         self.assertEqual(final_url, "https://example.com/")
         browser_get.assert_called_once()
+
+    def test_siteground_soft_200_challenge_is_detected(self):
+        self.assertTrue(
+            _looks_like_bot_challenge(
+                "<title>Robot Challenge Screen</title>Checking the site connection security",
+                "https://example.com/",
+            )
+        )
+
+    def test_soft_200_challenge_is_replaced_by_browser_content(self):
+        challenge = mock.Mock(
+            status_code=200,
+            is_redirect=False,
+            is_permanent_redirect=False,
+            headers={"Content-Type": "text/html"},
+            encoding="utf-8",
+        )
+        challenge.iter_content.return_value = [
+            b"<title>Robot Challenge Screen</title>Checking the site connection security"
+        ]
+        challenge.raise_for_status.return_value = None
+        session = mock.Mock()
+        session.get.return_value = challenge
+        with mock.patch(
+            "vision_aid.site_audit.crawler._browser_fetch",
+            return_value=(
+                "<html lang='en'><title>Real page</title></html>",
+                "https://example.com/",
+                "text/html",
+            ),
+        ) as browser_fetch:
+            html, _ = fetch_public_html("https://example.com/", session=session)
+        self.assertIn("Real page", html)
+        browser_fetch.assert_called_once()
 
 
 class EmailTests(unittest.TestCase):

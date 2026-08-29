@@ -77,6 +77,8 @@ googleapis-common-protos==1.75.2
     #   google-api-core
     #   grpc-google-iam-v1
     #   grpcio-status
+greenlet==3.5.5
+    # via playwright
 grpc-google-iam-v1==0.14.5
     # via google-cloud-tasks
 grpcio==1.83.1
@@ -111,6 +113,8 @@ lxml==6.1.1
     # via visionaid
 openai==2.53.0
     # via visionaid
+playwright==1.62.0
+    # via visionaid
 proto-plus==1.28.4
     # via
     #   google-api-core
@@ -138,6 +142,8 @@ pydantic==2.13.4
     #   openai
 pydantic-core==2.46.4
     # via pydantic
+pyee==13.0.1
+    # via playwright
 python-dotenv==1.2.2
     # via visionaid
 requests==2.34.2
@@ -168,6 +174,7 @@ typing-extensions==4.16.0
     #   openai
     #   pydantic
     #   pydantic-core
+    #   pyee
     #   typing-inspection
 typing-inspection==0.4.2
     # via pydantic

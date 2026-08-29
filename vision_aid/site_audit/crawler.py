@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import re
 import socket
+import time
 import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
@@ -111,6 +113,13 @@ SKIP_QUERY_KEYS = {
     "replytocom",
     "wc-ajax",
 }
+BOT_CHALLENGE_MARKERS = (
+    "robot challenge screen",
+    "checking the site connection security",
+    "d1rozh26tys225.cloudfront.net/loader.svg",
+    "sg-captcha",
+    "sgcaptcha",
+)
 
 
 @dataclass(frozen=True)
@@ -193,6 +202,96 @@ def validate_public_url(url: str) -> str:
     return normalized
 
 
+def _looks_like_bot_challenge(body: str, final_url: str) -> bool:
+    """Recognize soft-200 interstitials that must never be audited as pages."""
+    path = urlparse(final_url).path.lower()
+    if "/.well-known/sgcaptcha" in path or "/.well-known/captcha" in path:
+        return True
+    sample = body[:250_000].lower()
+    return any(marker in sample for marker in BOT_CHALLENGE_MARKERS)
+
+
+def _browser_fetch(
+    url: str,
+    *,
+    timeout: int,
+    max_bytes: int,
+    accepted_types: tuple[str, ...],
+) -> tuple[str, str, str]:
+    """Solve JavaScript interstitials in Chromium while preserving SSRF checks."""
+    from playwright.sync_api import sync_playwright
+
+    original = validate_public_url(url)
+    executable = os.getenv("DAT_CHROMIUM_EXECUTABLE", "").strip() or None
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            executable_path=executable,
+            headless=True,
+            args=["--disable-dev-shm-usage", "--no-sandbox"],
+        )
+        try:
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                extra_http_headers={
+                    "Accept-Language": REQUEST_HEADERS["Accept-Language"]
+                },
+                service_workers="block",
+            )
+            page = context.new_page()
+
+            def safe_route(route, request):
+                request_url = request.url
+                if request_url.startswith(("http://", "https://")):
+                    try:
+                        validate_public_url(request_url)
+                    except ValueError:
+                        route.abort("blockedbyclient")
+                        return
+                route.continue_()
+
+            page.route("**/*", safe_route)
+            response = page.goto(
+                original,
+                wait_until="domcontentloaded",
+                timeout=timeout * 1_000,
+            )
+            deadline = time.monotonic() + min(25, timeout)
+            while _looks_like_bot_challenge(page.content(), page.url):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "The site's browser security challenge could not be completed"
+                    )
+                page.wait_for_timeout(1_000)
+
+            # Reload after the challenge so ``response.body()`` is the actual
+            # requested resource rather than the initial interstitial.
+            response = page.reload(
+                wait_until="domcontentloaded",
+                timeout=timeout * 1_000,
+            )
+            final_url = validate_public_url(page.url)
+            if response is None:
+                raise RuntimeError("The browser did not return a page response")
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if accepted_types and not any(content_type == item for item in accepted_types):
+                raise ValueError(f"Unsupported content type: {content_type or 'unknown'}")
+            content = response.body()
+            if len(content) > max_bytes:
+                raise ValueError(
+                    f"Response exceeds the {max_bytes // (1024 * 1024)} MB limit"
+                )
+            encoding_match = re.search(
+                r"charset=([A-Za-z0-9._-]+)", response.headers.get("content-type", "")
+            )
+            encoding = encoding_match.group(1) if encoding_match else "utf-8"
+            body = content.decode(encoding, errors="replace")
+            if _looks_like_bot_challenge(body, final_url):
+                raise RuntimeError("The site returned a browser security challenge")
+            return body, canonicalize_url(final_url), content_type
+        finally:
+            browser.close()
+
+
 def _request(
     session: requests.Session,
     url: str,
@@ -262,6 +361,13 @@ def _request(
         body = b"".join(chunks).decode(encoding, errors="replace")
         final_url = canonicalize_url(current)
         response.close()
+        if _looks_like_bot_challenge(body, final_url):
+            return _browser_fetch(
+                current,
+                timeout=max(timeout, 45),
+                max_bytes=max_bytes,
+                accepted_types=accepted_types,
+            )
         return body, final_url, content_type
     raise ValueError("Too many redirects")
 
