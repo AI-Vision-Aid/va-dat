@@ -1114,6 +1114,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "beautifulsoup4" },
+    { name = "cryptography" },
     { name = "google-cloud-firestore" },
     { name = "google-cloud-storage" },
     { name = "google-cloud-tasks" },
@@ -1128,6 +1129,7 @@ dependencies = [
 requires-dist = [
     { name = "anthropic", specifier = "~=0.84.0" },
     { name = "beautifulsoup4", specifier = ">=4.9.2" },
+    { name = "cryptography", specifier = ">=45.0.0" },
     { name = "google-cloud-firestore", specifier = ">=2.21.0" },
     { name = "google-cloud-storage", specifier = ">=3.3.0" },
     { name = "google-cloud-tasks", specifier = ">=2.19.0" },

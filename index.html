@@ -552,8 +552,8 @@
                   </button>
                 </div>
                 <p class="field-hint" id="apiKeyHint">
-                  Without a key, only programmatic checks run. Never stored or
-                  logged.
+                  Without a key, only programmatic checks run. Keys are never
+                  logged or returned by the server.
                 </p>
                 <p
                   class="key-validate-status"
@@ -693,12 +693,70 @@
       const modelSelect = document.getElementById("modelSelect");
       const apiKeyLabel = document.getElementById("apiKeyLabel");
       const apiKeyInput = document.getElementById("apiKeyInput");
+      const apiKeyHint = document.getElementById("apiKeyHint");
+      let siteAuditConfig = {
+        model: "gpt-5.6-sol",
+        api_key_configured: false,
+        api_key_verified: false,
+        api_key_masked: "",
+      };
+
+      function showSavedKeyStatus() {
+        if (getAuditMode() !== "site" || apiKeyInput.value.trim()) return;
+        const provider = getProvider(modelSelect.value);
+        apiKeyValidateStatus.hidden = false;
+        if (provider !== "openai") {
+          apiKeyValidateStatus.className = "key-validate-status validating";
+          apiKeyValidateStatus.textContent =
+            "Enter and validate an API key for this provider.";
+        } else if (siteAuditConfig.api_key_verified) {
+          apiKeyValidateStatus.className = "key-validate-status valid";
+          apiKeyValidateStatus.textContent =
+            "✓ Saved OpenAI API key verified for " + modelSelect.value;
+        } else if (siteAuditConfig.api_key_configured) {
+          apiKeyValidateStatus.className = "key-validate-status invalid";
+          apiKeyValidateStatus.textContent =
+            "Saved key configured but not verified for this model. Select Validate to retry.";
+        } else {
+          apiKeyValidateStatus.className = "key-validate-status invalid";
+          apiKeyValidateStatus.textContent =
+            "No saved OpenAI API key is available.";
+        }
+      }
+
+      async function loadSiteAuditConfig(model, refresh) {
+        const params = new URLSearchParams();
+        if (model) params.set("model", model);
+        if (refresh) params.set("refresh", "1");
+        try {
+          const response = await fetch(
+            "/api/site-audit-config" + (params.toString() ? "?" + params : "")
+          );
+          const result = await response.json();
+          if (response.ok && result.success) {
+            siteAuditConfig = result.config;
+            updateApiKeyField();
+            showSavedKeyStatus();
+          }
+        } catch {
+          if (getAuditMode() === "site") {
+            apiKeyValidateStatus.hidden = false;
+            apiKeyValidateStatus.className = "key-validate-status invalid";
+            apiKeyValidateStatus.textContent =
+              "Could not check the saved API key status.";
+          }
+        }
+      }
 
       function updateApiKeyField() {
         const provider = getProvider(modelSelect.value);
+        const isSite = getAuditMode() === "site";
         if (provider === "openai") {
           apiKeyLabel.textContent = "OpenAI API Key";
-          apiKeyInput.placeholder = "sk-…";
+          apiKeyInput.placeholder =
+            isSite && siteAuditConfig.api_key_configured
+              ? (siteAuditConfig.api_key_masked || "••••••••••••••••") + " (saved)"
+              : "sk-…";
         } else if (provider === "gemini") {
           apiKeyLabel.textContent = "Gemini API Key";
           apiKeyInput.placeholder = "Gemini API key…";
@@ -706,9 +764,17 @@
           apiKeyLabel.textContent = "Anthropic API Key";
           apiKeyInput.placeholder = "sk-ant-api03-…";
         }
+        apiKeyHint.textContent = isSite
+          ? "The saved server key is used when this field is empty. Enter a different key only to override it for this audit; the saved key is never sent to your browser."
+          : "Without a key, only programmatic checks run. Keys are never logged or returned by the server.";
       }
 
-      modelSelect.addEventListener("change", updateApiKeyField);
+      modelSelect.addEventListener("change", () => {
+        updateApiKeyField();
+        if (getAuditMode() === "site" && !apiKeyInput.value.trim()) {
+          loadSiteAuditConfig(modelSelect.value, false);
+        }
+      });
 
       // ── API key validation ────────────────────────────────────────────────────
       const validateKeyBtn = document.getElementById("validateKeyBtn");
@@ -718,14 +784,19 @@
 
       validateKeyBtn.addEventListener("click", async () => {
         const key = apiKeyInput.value.trim();
-        if (!key) {
+        const model = modelSelect.value;
+        const provider = getProvider(model);
+        const useSaved =
+          !key &&
+          getAuditMode() === "site" &&
+          provider === "openai" &&
+          siteAuditConfig.api_key_configured;
+        if (!key && !useSaved) {
           apiKeyValidateStatus.hidden = false;
           apiKeyValidateStatus.className = "key-validate-status invalid";
           apiKeyValidateStatus.textContent = "Please enter an API key first.";
           return;
         }
-
-        const provider = getProvider(modelSelect.value);
 
         validateKeyBtn.disabled = true;
         apiKeyValidateStatus.hidden = false;
@@ -736,7 +807,12 @@
           const resp = await fetch("/api/validate-key", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ api_key: key, provider }),
+            body: JSON.stringify({
+              api_key: key,
+              provider,
+              model,
+              use_saved: useSaved,
+            }),
           });
           const result = await resp.json();
           if (result.valid) {
@@ -776,6 +852,7 @@
         apiKeyValidateStatus.hidden = true;
         apiKeyValidateStatus.textContent = "";
         apiKeyValidateStatus.className = "key-validate-status";
+        if (!apiKeyInput.value.trim()) showSavedKeyStatus();
       });
 
       // Input mode switching
@@ -792,7 +869,16 @@
           htmlInputSection.hidden = !isHtml;
           urlInputSection.hidden = isHtml;
           siteEmailSection.hidden = !isSite;
-          modelKeySection.hidden = isSite;
+          modelKeySection.hidden = false;
+          if (isSite) {
+            modelSelect.value = siteAuditConfig.model || "gpt-5.6-sol";
+            apiKeyInput.value = "";
+            updateApiKeyField();
+            loadSiteAuditConfig(modelSelect.value, false);
+          } else {
+            updateApiKeyField();
+            apiKeyValidateStatus.hidden = true;
+          }
           document.getElementById("auditSubmitBtn").textContent = isSite
             ? "Queue Whole-Site Audit"
             : "Run Audit";
@@ -805,6 +891,8 @@
       function getAuditMode() {
         return document.querySelector('input[name="auditMode"]:checked').value;
       }
+
+      loadSiteAuditConfig();
 
       // ── Drag-and-drop / file input ────────────────────────────────────────────
       let htmlFileContent = null;
@@ -960,7 +1048,8 @@
                       return;
                     }
                     endpoint = "/api/site-audits";
-                    requestBody = { url: urlVal, email };
+                    requestBody = { url: urlVal, email, model };
+                    if (keyValue) requestBody.api_key = keyValue;
                   } else {
                     endpoint =
                             mode === "url-nested"

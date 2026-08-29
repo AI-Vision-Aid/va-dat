@@ -11,11 +11,14 @@ import os
 import re
 import secrets
 import smtplib
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
+from cryptography.fernet import Fernet, InvalidToken
 from google.api_core.exceptions import AlreadyExists
 from google.cloud import firestore, storage, tasks_v2
 from google.cloud.firestore_v1.base_query import FieldFilter
@@ -28,6 +31,7 @@ from .report import build_site_report
 ACTIVE_STATUSES = {"queued", "discovering", "auditing", "finalizing"}
 TERMINAL_PAGE_STATUSES = {"complete", "failed"}
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,99}$")
 
 
 def _now() -> datetime:
@@ -48,6 +52,62 @@ def validate_request_email(address: str, allowed_domains: set[str]) -> str:
         allowed = ", ".join(sorted(allowed_domains))
         raise ValueError(f"Report delivery is currently limited to: {allowed}")
     return normalized
+
+
+def _model_provider(model: str) -> str:
+    if model.startswith(("gpt-", "o1", "o3", "o4")):
+        return "openai"
+    if model.startswith("gemini-"):
+        return "gemini"
+    if model.startswith("claude-"):
+        return "anthropic"
+    raise ValueError("Select a supported OpenAI, Anthropic, or Gemini model")
+
+
+def validate_model_name(model: str) -> str:
+    normalized = str(model or "").strip()
+    if not MODEL_PATTERN.fullmatch(normalized):
+        raise ValueError("Select a valid model")
+    _model_provider(normalized)
+    return normalized
+
+
+def verify_model_key(api_key: str, model: str) -> tuple[bool, str]:
+    """Verify a provider credential without exposing it or generating tokens."""
+    key = str(api_key or "").strip()
+    if not key:
+        return False, "No API key is configured"
+    try:
+        provider = _model_provider(validate_model_name(model))
+        if provider == "openai":
+            request = urllib.request.Request(
+                f"https://api.openai.com/v1/models/{quote(model, safe='')}",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        elif provider == "gemini":
+            request = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models?key={quote(key, safe='')}",
+            )
+        else:
+            request = urllib.request.Request(
+                "https://api.anthropic.com/v1/models",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+        with urllib.request.urlopen(request, timeout=15):
+            return True, "Verified"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, "Invalid or unauthorized API key"
+        if exc.code == 404 and provider == "openai":
+            return False, "The selected model is not available to this API key"
+        return False, f"Provider returned HTTP {exc.code}"
+    except ValueError as exc:
+        return False, str(exc)
+    except Exception:
+        return False, "Could not verify the API key with the provider"
 
 
 def _safe_task_id(value: str) -> str:
@@ -143,6 +203,9 @@ class SiteAuditCoordinator:
         self.job_token = os.getenv("DAT_JOB_TOKEN", "").strip()
         self.model = os.getenv("DAT_MODEL", "gpt-5.6-sol")
         self.api_key = os.getenv("DAT_OPENAI_API_KEY", "").strip()
+        self.credential_encryption_key = os.getenv(
+            "DAT_CREDENTIAL_ENCRYPTION_KEY", ""
+        ).strip()
         self.allowed_domains = {
             item.strip().lower()
             for item in os.getenv("DAT_ALLOWED_EMAIL_DOMAINS", "").split(",")
@@ -152,6 +215,8 @@ class SiteAuditCoordinator:
         self._db = None
         self._storage = None
         self._dispatcher = None
+        self._credential_cipher = None
+        self._key_verification_cache: dict[str, tuple[datetime, bool, str]] = {}
 
     @property
     def configured(self) -> bool:
@@ -161,7 +226,80 @@ class SiteAuditCoordinator:
             and self.bucket_name
             and self.job_token
             and self.api_key
+            and self.credential_encryption_key
         )
+
+    @property
+    def credential_cipher(self) -> Fernet:
+        if self._credential_cipher is None:
+            if not self.credential_encryption_key:
+                raise RuntimeError("Credential override encryption is not configured")
+            try:
+                self._credential_cipher = Fernet(
+                    self.credential_encryption_key.encode("ascii")
+                )
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("Credential override encryption is invalid") from exc
+        return self._credential_cipher
+
+    def _verify_saved_key(self, model: str, *, refresh: bool = False) -> tuple[bool, str]:
+        selected_model = validate_model_name(model)
+        if _model_provider(selected_model) != "openai":
+            return False, "The saved credential is an OpenAI API key"
+        cached = self._key_verification_cache.get(selected_model)
+        if cached and not refresh and _now() - cached[0] < timedelta(minutes=5):
+            return cached[1], cached[2]
+        valid, message = verify_model_key(self.api_key, selected_model)
+        self._key_verification_cache[selected_model] = (_now(), valid, message)
+        return valid, message
+
+    def public_config(self, *, model: str | None = None, refresh: bool = False) -> dict:
+        """Return non-secret model and saved-key state for the signed-in UI."""
+        selected_model = validate_model_name(model or self.model)
+        saved_available = bool(self.api_key and _model_provider(selected_model) == "openai")
+        verified, message = (
+            self._verify_saved_key(selected_model, refresh=refresh)
+            if saved_available
+            else (False, "Enter an API key for the selected provider")
+        )
+        return {
+            "model": self.model,
+            "selected_model": selected_model,
+            "provider": _model_provider(selected_model),
+            "api_key_configured": saved_available,
+            "api_key_masked": "••••••••••••••••" if saved_available else "",
+            "api_key_verified": verified,
+            "verification_message": message,
+        }
+
+    def verify_requested_key(
+        self,
+        *,
+        model: str,
+        api_key: str = "",
+        use_saved: bool = False,
+        refresh: bool = False,
+    ) -> tuple[bool, str]:
+        selected_model = validate_model_name(model)
+        if use_saved:
+            return self._verify_saved_key(selected_model, refresh=refresh)
+        return verify_model_key(api_key, selected_model)
+
+    def _encrypt_credential(self, api_key: str) -> str:
+        return self.credential_cipher.encrypt(api_key.encode("utf-8")).decode("ascii")
+
+    def _job_api_key(self, job: dict) -> str:
+        encrypted = str(job.get("credential_override", ""))
+        if encrypted:
+            try:
+                return self.credential_cipher.decrypt(
+                    encrypted.encode("ascii"), ttl=31 * 24 * 60 * 60
+                ).decode("utf-8")
+            except (InvalidToken, ValueError, TypeError) as exc:
+                raise RuntimeError("The job credential override is unavailable") from exc
+        if _model_provider(str(job.get("model", self.model))) == "openai":
+            return self.api_key
+        raise RuntimeError("No API key is available for the selected model")
 
     @property
     def db(self):
@@ -193,12 +331,35 @@ class SiteAuditCoordinator:
     def internal_token_valid(self, supplied: str) -> bool:
         return bool(self.job_token and hmac.compare_digest(self.job_token, supplied or ""))
 
-    def create_job(self, *, base_url: str, email: str) -> dict:
+    def create_job(
+        self,
+        *,
+        base_url: str,
+        email: str,
+        model: str = "",
+        api_key: str = "",
+    ) -> dict:
         """Persist and enqueue a new whole-site audit job."""
         if not self.configured:
             raise RuntimeError("Asynchronous site auditing is not configured")
         normalized_url = validate_public_url(str(base_url or ""))
         normalized_email = validate_request_email(email, self.allowed_domains)
+        selected_model = validate_model_name(model or self.model)
+        override_key = str(api_key or "").strip()
+        if override_key:
+            valid, message = verify_model_key(override_key, selected_model)
+            if not valid:
+                raise ValueError(message)
+            encrypted_override = self._encrypt_credential(override_key)
+            credential_source = "override"
+        else:
+            if _model_provider(selected_model) != "openai":
+                raise ValueError("Enter an API key when selecting a non-OpenAI model")
+            valid, message = self._verify_saved_key(selected_model)
+            if not valid:
+                raise ValueError(message)
+            encrypted_override = ""
+            credential_source = "saved"
         email_hash = _email_hash(normalized_email)
 
         recent_for_email = (
@@ -220,7 +381,8 @@ class SiteAuditCoordinator:
             "email": normalized_email,
             "email_hash": email_hash,
             "status": "queued",
-            "model": self.model,
+            "model": selected_model,
+            "credential_source": credential_source,
             "max_pages": 200,
             "pages_total": 0,
             "pages_completed": 0,
@@ -231,6 +393,8 @@ class SiteAuditCoordinator:
             "updated_at": _now(),
             "expires_at": _now() + timedelta(days=30),
         }
+        if encrypted_override:
+            job["credential_override"] = encrypted_override
         self._job_ref(job_id).set(job)
         try:
             self.dispatcher.enqueue(
@@ -295,8 +459,8 @@ class SiteAuditCoordinator:
             job_ref.update({"status": "discovering", "updated_at": _now()})
             discovery = discover_site_urls(
                 job["base_url"],
-                api_key=self.api_key,
-                model=self.model,
+                api_key=self._job_api_key(job),
+                model=job["model"],
                 max_pages=200,
             )
             batch = self.db.batch()
@@ -423,7 +587,11 @@ class SiteAuditCoordinator:
 
         try:
             html_content, final_url = fetch_public_html(page["url"])
-            result = audit_callable(html_content, self.api_key, self.model)
+            result = audit_callable(
+                html_content,
+                self._job_api_key(job),
+                job["model"],
+            )
             if not result.get("success"):
                 raise RuntimeError(result.get("error") or "Page audit failed")
             csv_text = result.get("csv_report") or ""
@@ -517,6 +685,13 @@ class SiteAuditCoordinator:
             report.csv_bytes, content_type="text/csv; charset=utf-8"
         )
         download_url = f"{self.service_url}/api/site-audits/{job_id}/report"
+        if job.get("credential_override"):
+            job_ref.update(
+                {
+                    "credential_override": firestore.DELETE_FIELD,
+                    "credential_cleared_at": _now(),
+                }
+            )
         try:
             send_report_email(
                 recipient=job["email"],

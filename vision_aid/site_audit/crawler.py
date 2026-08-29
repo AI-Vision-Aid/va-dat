@@ -1,4 +1,4 @@
-"""Safe, sitemap-aware whole-site discovery with AI-assisted selection."""
+"""Safe, multi-source whole-site discovery with AI-assisted ordering."""
 
 from __future__ import annotations
 
@@ -16,7 +16,17 @@ import requests
 from bs4 import BeautifulSoup
 
 
-USER_AGENT = "VisionAid-DAT/1.0 (+https://www.visionaid.org/)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0.0.0 Safari/537.36"
+)
+REQUEST_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml,text/xml;q=0.9,*/*;q=0.1",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
 TRACKING_PARAMS = {
     "fbclid",
     "gclid",
@@ -66,10 +76,41 @@ SKIP_EXTENSIONS = {
     ".xml",
     ".zip",
 }
-SITEMAP_LIMIT = 50
+SITEMAP_LIMIT = 100
 CANDIDATE_LIMIT = 2_000
 DISCOVERY_FETCH_LIMIT = 400
 MAX_HTML_BYTES = 8 * 1024 * 1024
+COMMON_SITEMAP_PATHS = (
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemap-index.xml",
+    "/wp-sitemap.xml",
+)
+SKIP_PATH_PREFIXES = (
+    "/wp-admin",
+    "/wp-json",
+    "/wp-login.php",
+    "/admin",
+    "/login",
+    "/logout",
+)
+SKIP_QUERY_ACTIONS = {
+    "delete",
+    "edit",
+    "lostpassword",
+    "logout",
+    "register",
+    "resetpass",
+}
+SKIP_QUERY_KEYS = {
+    "add-to-cart",
+    "customize_changeset_uuid",
+    "elementor-preview",
+    "elementor_snippet",
+    "preview",
+    "replytocom",
+    "wc-ajax",
+}
 
 
 @dataclass(frozen=True)
@@ -163,7 +204,7 @@ def _request(
     for _ in range(6):
         response = session.get(
             current,
-            headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml,text/xml;q=0.9,*/*;q=0.1"},
+            headers=REQUEST_HEADERS,
             timeout=timeout,
             allow_redirects=False,
             stream=True,
@@ -234,10 +275,15 @@ def _fetch_text_or_xml(
 
 
 def _sitemap_locations(base_url: str, session: requests.Session) -> list[str]:
-    """Return robots-declared sitemaps plus the conventional sitemap URL."""
+    """Return robots-declared and common sitemap locations.
+
+    Some hosts block ``robots.txt`` or redirect ``sitemap.xml`` differently for
+    cloud data-center traffic. Trying the standard index variants directly
+    prevents one failed discovery endpoint from collapsing a crawl to one page.
+    """
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    locations = [urljoin(origin, "/sitemap.xml")]
+    locations = [urljoin(origin, path) for path in COMMON_SITEMAP_PATHS]
     try:
         robots, _ = _fetch_text_or_xml(session, urljoin(origin, "/robots.txt"))
         for line in robots.splitlines():
@@ -292,7 +338,76 @@ def _is_candidate_url(url: str, base_url: str) -> bool:
     if not _is_same_site(url, base_url):
         return False
     path = parsed.path.lower()
-    return not any(path.endswith(extension) for extension in SKIP_EXTENSIONS)
+    normalized_path = path.rstrip("/") or "/"
+    if any(path.endswith(extension) for extension in SKIP_EXTENSIONS):
+        return False
+    if any(normalized_path == prefix or normalized_path.startswith(f"{prefix}/") for prefix in SKIP_PATH_PREFIXES):
+        return False
+    if normalized_path.endswith("/feed"):
+        return False
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if any(key.lower() in SKIP_QUERY_KEYS for key in query):
+        return False
+    if str(query.get("action", "")).lower() in SKIP_QUERY_ACTIONS:
+        return False
+    return True
+
+
+def _discover_wordpress_urls(base_url: str, session: requests.Session) -> list[str]:
+    """Discover public WordPress content through its read-only REST index.
+
+    This is a fallback for WordPress sites whose HTML or sitemap requests are
+    blocked for cloud crawlers. Only canonical public ``link`` values returned
+    by the site's own API are accepted, and the normal same-site/safety filters
+    still apply.
+    """
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    rest_bases = ["pages", "posts"]
+    try:
+        types_text, _ = _fetch_text_or_xml(
+            session, urljoin(origin, "/wp-json/wp/v2/types")
+        )
+        types = json.loads(types_text)
+        if isinstance(types, dict):
+            discovered_bases = [
+                str(item.get("rest_base", "")).strip("/")
+                for item in types.values()
+                if isinstance(item, dict) and item.get("viewable") is not False
+            ]
+            rest_bases = list(
+                dict.fromkeys(item for item in discovered_bases if item)
+            ) or rest_bases
+    except Exception:
+        pass
+
+    page_urls: list[str] = []
+    for rest_base in rest_bases[:25]:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", rest_base):
+            continue
+        for page_number in range(1, 21):
+            endpoint = urljoin(
+                origin,
+                f"/wp-json/wp/v2/{rest_base}?per_page=100&page={page_number}&_fields=link,status",
+            )
+            try:
+                body, _ = _fetch_text_or_xml(session, endpoint)
+                rows = json.loads(body)
+            except Exception:
+                break
+            if not isinstance(rows, list):
+                break
+            for row in rows:
+                if not isinstance(row, dict) or row.get("status") not in (None, "publish"):
+                    continue
+                candidate = canonicalize_url(str(row.get("link", "")))
+                if _is_candidate_url(candidate, base_url) and candidate not in page_urls:
+                    page_urls.append(candidate)
+                    if len(page_urls) >= CANDIDATE_LIMIT:
+                        return page_urls
+            if len(rows) < 100:
+                break
+    return page_urls
 
 
 def _extract_links(html: str, page_url: str, base_url: str) -> tuple[str, list[str]]:
@@ -315,14 +430,14 @@ def _parse_json_object(text: str) -> dict:
     return json.loads(cleaned)
 
 
-def _ai_filter_candidates(
+def _ai_order_candidates(
     candidates: list[PageCandidate],
     *,
     api_key: str,
     model: str,
     max_pages: int,
 ) -> list[PageCandidate]:
-    """Use OpenAI to identify and order public, user-facing HTML pages."""
+    """Use OpenAI to order candidates without ever dropping one."""
     if not api_key or not candidates:
         return candidates[:max_pages]
 
@@ -333,13 +448,12 @@ def _ai_filter_candidates(
         f"{index}\t{candidate.url}\t{candidate.title or '(title unknown)'}\t{candidate.source}"
         for index, candidate in enumerate(candidates)
     )
-    prompt = f"""You are selecting pages for a whole-site WCAG accessibility audit.
+    prompt = f"""You are ordering pages for a whole-site WCAG accessibility audit.
 The deterministic crawler found the numbered same-site URL candidates below.
-Return public, user-facing HTML pages only. Exclude logout/action endpoints,
-admin-only paths, duplicate query variants, feeds, downloads, and obvious
-non-pages. Prefer canonical, representative pages and put the most important
-pages first. Never invent a URL. Return JSON only as
-{{"include":[integer indexes]}} with at most {max_pages} unique indexes.
+The crawler has already removed administrative actions, feeds, downloads, and
+obvious non-pages. Put the most important public pages first, but return EVERY
+candidate index exactly once. Never invent an index or URL. Return JSON only as
+{{"order":[integer indexes]}}.
 
 Candidates:
 {rows}
@@ -352,17 +466,14 @@ Candidates:
     )
     parsed = _parse_json_object(response.output_text)
     indexes: list[int] = []
-    for value in parsed.get("include", []):
+    for value in parsed.get("order", []):
         try:
             index = int(value)
         except (TypeError, ValueError):
             continue
         if 0 <= index < len(candidates) and index not in indexes:
             indexes.append(index)
-        if len(indexes) >= max_pages:
-            break
-    if not indexes:
-        return candidates[:max_pages]
+    indexes.extend(index for index in range(len(candidates)) if index not in indexes)
     return [candidates[index] for index in indexes]
 
 
@@ -374,12 +485,13 @@ def discover_site_urls(
     max_pages: int = 200,
     session: requests.Session | None = None,
 ) -> DiscoveryResult:
-    """Discover, AI-filter, and order up to ``max_pages`` site pages.
+    """Discover and order up to ``max_pages`` site pages.
 
-    Discovery combines the site's sitemap/robots declarations with a bounded
-    breadth-first traversal of same-site links. The model may filter and order
-    only URLs the deterministic crawler actually found; hallucinated URLs are
-    therefore impossible to add to the audit.
+    Discovery combines robots declarations, common recursive sitemap indexes,
+    public WordPress REST metadata when available, and a bounded breadth-first
+    traversal of same-site links. The model may reorder only URLs the
+    deterministic crawler actually found. It cannot remove pages or add
+    hallucinated URLs.
     """
     if not 1 <= max_pages <= 200:
         raise ValueError("max_pages must be between 1 and 200")
@@ -387,13 +499,18 @@ def discover_site_urls(
     active_session = session or requests.Session()
 
     sitemap_urls, sitemap_count = _read_sitemaps(normalized_base, active_session)
-    queue = deque([normalized_base, *sitemap_urls])
+    wordpress_urls = _discover_wordpress_urls(normalized_base, active_session)
+    queue = deque([normalized_base, *sitemap_urls, *wordpress_urls])
     candidates: dict[str, PageCandidate] = {
         normalized_base: PageCandidate(normalized_base, source="base")
     }
     for sitemap_url in sitemap_urls:
         candidates.setdefault(
             sitemap_url, PageCandidate(sitemap_url, source="sitemap")
+        )
+    for wordpress_url in wordpress_urls:
+        candidates.setdefault(
+            wordpress_url, PageCandidate(wordpress_url, source="cms")
         )
 
     fetched: set[str] = set()
@@ -425,17 +542,21 @@ def discover_site_urls(
     ordered = list(candidates.values())
     base_candidate = candidates[normalized_base]
     ordered = [base_candidate, *[item for item in ordered if item.url != normalized_base]]
-    ai_used = bool(api_key)
+    ai_used = bool(api_key and model.startswith(("gpt-", "o1", "o3", "o4")))
     try:
-        selected = _ai_filter_candidates(
-            ordered,
-            api_key=api_key,
-            model=model,
-            max_pages=max_pages,
+        selected = (
+            _ai_order_candidates(
+                ordered,
+                api_key=api_key,
+                model=model,
+                max_pages=max_pages,
+            )
+            if ai_used
+            else ordered
         )
     except Exception as exc:
-        print(f"  WARNING: AI page selection failed ({exc}); using crawler order")
-        selected = ordered[:max_pages]
+        print(f"  WARNING: AI page ordering failed ({exc}); using crawler order")
+        selected = ordered
         ai_used = False
 
     if normalized_base not in {item.url for item in selected}:

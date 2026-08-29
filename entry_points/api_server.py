@@ -28,7 +28,7 @@ import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv
 
@@ -260,6 +260,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._serve_file(STATIC_DIR / "styles.css", "text/css; charset=utf-8")
         elif path == "/api/health":
             self._handle_health()
+        elif path == "/api/site-audit-config":
+            self._handle_site_audit_config()
         elif re.fullmatch(r"/api/site-audits/[A-Za-z0-9_-]+/report", path):
             self._handle_site_audit_report(path)
         elif re.fullmatch(r"/api/site-audits/[A-Za-z0-9_-]+", path):
@@ -612,56 +614,37 @@ class AuditHandler(BaseHTTPRequestHandler):
         _send_event(merged)
 
     def _handle_validate_key(self):
-        """Validate an API key with a lightweight call to the provider."""
-        import urllib.request
-        import urllib.error
-
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
+        """Validate an entered or saved API key without returning the key."""
         try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self._send_json({"valid": False, "error": "Invalid JSON"}, 400)
+            data = self._read_json_body()
+        except ValueError as exc:
+            self._send_json({"valid": False, "error": str(exc)}, 400)
             return
 
-        api_key = data.get("api_key", "").strip()
         provider = data.get("provider", "anthropic")
-
-        if not api_key:
-            self._send_json({"valid": False, "error": "No key provided"})
-            return
-
+        default_models = {
+            "openai": "gpt-5.6-sol",
+            "gemini": "gemini-flash-latest",
+            "anthropic": "claude-haiku-4-5-20251001",
+        }
+        model = str(data.get("model") or default_models.get(provider, "")).strip()
         try:
-            if provider == "openai":
-                req = urllib.request.Request(
-                    "https://api.openai.com/v1/models",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-            elif provider == "gemini":
-                req = urllib.request.Request(
-                    f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-                )
-            else:
-                req = urllib.request.Request(
-                    "https://api.anthropic.com/v1/models",
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                    },
-                )
-            with urllib.request.urlopen(req, timeout=10):
-                self._send_json({"valid": True})
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403):
-                self._send_json(
-                    {"valid": False, "error": "Invalid or unauthorized API key"}
-                )
-            else:
-                self._send_json(
-                    {"valid": False, "error": f"Provider returned HTTP {exc.code}"}
-                )
-        except Exception as exc:
-            self._send_json({"valid": False, "error": str(exc)})
+            valid, message = get_coordinator().verify_requested_key(
+                model=model,
+                api_key=str(data.get("api_key", "")),
+                use_saved=bool(data.get("use_saved")),
+                refresh=True,
+            )
+            self._send_json(
+                {
+                    "valid": valid,
+                    "message": message if valid else "",
+                    "error": "" if valid else message,
+                    "model": model,
+                }
+            )
+        except ValueError as exc:
+            self._send_json({"valid": False, "error": str(exc)}, 400)
 
     def _read_json_body(self) -> dict:
         """Read and parse one bounded JSON request body."""
@@ -686,8 +669,27 @@ class AuditHandler(BaseHTTPRequestHandler):
                 "async_site_audit_configured": coordinator.configured,
                 "async_model": coordinator.model,
                 "max_site_pages": 200,
+                "credential_override_encryption_configured": bool(
+                    coordinator.credential_encryption_key
+                ),
             }
         )
+
+    def _handle_site_audit_config(self):
+        """Return saved-key verification state without exposing credentials."""
+        query = parse_qs(urlparse(self.path).query)
+        model = str((query.get("model") or [""])[0]).strip() or None
+        refresh = str((query.get("refresh") or [""])[0]).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        try:
+            config = get_coordinator().public_config(model=model, refresh=refresh)
+        except ValueError as exc:
+            self._send_json({"success": False, "error": str(exc)}, 400)
+            return
+        self._send_json({"success": True, "config": config})
 
     def _handle_create_site_audit(self):
         """Create a durable whole-site audit and return immediately."""
@@ -696,6 +698,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             job = get_coordinator().create_job(
                 base_url=data.get("url", ""),
                 email=data.get("email", ""),
+                model=data.get("model", ""),
+                api_key=data.get("api_key", ""),
             )
         except ValueError as exc:
             self._send_json({"success": False, "error": str(exc)}, 400)
