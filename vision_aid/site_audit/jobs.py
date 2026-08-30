@@ -27,9 +27,10 @@ from google.protobuf import duration_pb2
 
 from .crawler import discover_site_urls, fetch_public_html, validate_public_url
 from .report import build_site_report
+from .url_list import safe_upload_name, validate_uploaded_urls
 
 
-ACTIVE_STATUSES = {"queued", "discovering", "auditing", "finalizing"}
+ACTIVE_STATUSES = {"queued", "discovering", "preparing", "auditing", "finalizing"}
 TERMINAL_PAGE_STATUSES = {"complete", "failed"}
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,99}$")
@@ -154,6 +155,7 @@ def send_report_email(
     findings: int,
     download_url: str,
     report_zip: bytes,
+    audit_mode: str = "crawl",
 ) -> dict:
     """Submit a completed report to SMTP and return its acceptance receipt."""
     smtp_host = os.getenv("SMTP_HOST", "").strip()
@@ -168,8 +170,13 @@ def send_report_email(
         raise RuntimeError("SMTP delivery is not configured")
 
     host = urlparse(base_url).hostname or base_url
+    is_url_list = audit_mode == "url_list"
     message = EmailMessage()
-    message["Subject"] = f"DAT whole-site accessibility report: {host}"
+    message["Subject"] = (
+        f"DAT URL-list accessibility report: {pages} page(s)"
+        if is_url_list
+        else f"DAT whole-site accessibility report: {host}"
+    )
     message["From"] = smtp_from
     message["To"] = recipient
     message["Date"] = format_datetime(_now())
@@ -190,8 +197,17 @@ def send_report_email(
         "yes",
     }
     message.set_content(
-        "Your Vision Aid DAT whole-site accessibility report is ready.\n\n"
-        f"Site: {base_url}\nPages processed: {pages}\nFindings: {findings}\n"
+        (
+            "Your Vision Aid DAT uploaded URL-list accessibility report is ready.\n\n"
+            if is_url_list
+            else "Your Vision Aid DAT whole-site accessibility report is ready.\n\n"
+        )
+        + (
+            f"First URL: {base_url}\n"
+            if is_url_list
+            else f"Site: {base_url}\n"
+        )
+        + f"Pages processed: {pages}\nFindings: {findings}\n"
         f"Download: {download_url}\n\n"
         "For reliable delivery, the report is provided through the secure download "
         "link instead of as an email attachment. Sign in with the DAT testing "
@@ -373,15 +389,28 @@ class SiteAuditCoordinator:
     def create_job(
         self,
         *,
-        base_url: str,
+        base_url: str = "",
         email: str,
         model: str = "",
         api_key: str = "",
+        audit_mode: str = "crawl",
+        uploaded_urls: list[str] | None = None,
+        source_file_name: str = "",
     ) -> dict:
-        """Persist and enqueue a new whole-site audit job."""
+        """Persist and enqueue a new crawl or uploaded URL-list audit job."""
         if not self.configured:
             raise RuntimeError("Asynchronous site auditing is not configured")
-        normalized_url = validate_public_url(str(base_url or ""))
+        normalized_mode = str(audit_mode or "crawl").strip().lower()
+        if normalized_mode not in {"crawl", "url_list"}:
+            raise ValueError("Select full-site crawl or uploaded URL-list mode")
+        normalized_file_name = ""
+        normalized_uploaded_urls: list[str] = []
+        if normalized_mode == "url_list":
+            normalized_uploaded_urls = validate_uploaded_urls(uploaded_urls or [])
+            normalized_url = normalized_uploaded_urls[0]
+            normalized_file_name = safe_upload_name(source_file_name)
+        else:
+            normalized_url = validate_public_url(str(base_url or ""))
         normalized_email = validate_request_email(email, self.allowed_domains)
         selected_model = validate_model_name(model or self.model)
         override_key = str(api_key or "").strip()
@@ -417,6 +446,7 @@ class SiteAuditCoordinator:
         job = {
             "job_id": job_id,
             "base_url": normalized_url,
+            "audit_mode": normalized_mode,
             "email": normalized_email,
             "email_hash": email_hash,
             "status": "queued",
@@ -426,12 +456,15 @@ class SiteAuditCoordinator:
             "pages_total": 0,
             "pages_completed": 0,
             "pages_failed": 0,
-            "candidate_count": 0,
+            "candidate_count": len(normalized_uploaded_urls),
             "capped": False,
             "created_at": _now(),
             "updated_at": _now(),
             "expires_at": _now() + timedelta(days=30),
         }
+        if normalized_mode == "url_list":
+            job["provided_urls"] = normalized_uploaded_urls
+            job["source_file_name"] = normalized_file_name
         if encrypted_override:
             job["credential_override"] = encrypted_override
         self._job_ref(job_id).set(job)
@@ -459,6 +492,8 @@ class SiteAuditCoordinator:
             for key in (
                 "job_id",
                 "base_url",
+                "audit_mode",
+                "source_file_name",
                 "status",
                 "model",
                 "max_pages",
@@ -494,7 +529,7 @@ class SiteAuditCoordinator:
             progress = 98
         elif total:
             progress = min(97, round((finished / total) * 97))
-        elif status == "discovering":
+        elif status in {"discovering", "preparing"}:
             progress = 2
         else:
             progress = 0
@@ -530,46 +565,68 @@ class SiteAuditCoordinator:
 
         existing_pages = list(job_ref.collection("pages").stream())
         if not existing_pages:
+            audit_mode = str(job.get("audit_mode") or "crawl")
             job_ref.update(
                 {
-                    "status": "discovering",
+                    "status": "preparing" if audit_mode == "url_list" else "discovering",
                     "discovery_started_at": _now(),
                     "updated_at": _now(),
                 }
             )
-            discovery = discover_site_urls(
-                job["base_url"],
-                api_key=self._job_api_key(job),
-                model=job["model"],
-                max_pages=200,
-            )
-            batch = self.db.batch()
-            for index, page in enumerate(discovery.pages):
-                page_ref = job_ref.collection("pages").document(f"{index:03d}")
-                batch.set(
-                    page_ref,
-                    {
-                        "index": index,
-                        "url": page.url,
-                        "title": page.title,
-                        "source": page.source,
-                        "status": "queued",
-                        "updated_at": _now(),
-                    },
+            if audit_mode == "url_list":
+                uploaded_urls = list(job.get("provided_urls") or [])
+                if not uploaded_urls:
+                    raise ValueError("The uploaded URL list is unavailable")
+                page_specs = [
+                    {"url": url, "title": "", "source": "upload"}
+                    for url in uploaded_urls
+                ]
+                discovery_metadata = {
+                    "pages_total": len(page_specs),
+                    "candidate_count": len(page_specs),
+                    "capped": False,
+                    "ai_discovery_used": False,
+                    "ai_web_discovery_used": False,
+                    "sitemap_count": 0,
+                    "discovery_sources": {"upload": len(page_specs)},
+                    "provided_urls": firestore.DELETE_FIELD,
+                }
+            else:
+                discovery = discover_site_urls(
+                    job["base_url"],
+                    api_key=self._job_api_key(job),
+                    model=job["model"],
+                    max_pages=200,
                 )
-            batch.commit()
-            job_ref.update(
-                {
-                    "pages_total": len(discovery.pages),
+                page_specs = [
+                    {"url": page.url, "title": page.title, "source": page.source}
+                    for page in discovery.pages
+                ]
+                discovery_metadata = {
+                    "pages_total": len(page_specs),
                     "candidate_count": discovery.candidate_count,
                     "capped": discovery.capped,
                     "ai_discovery_used": discovery.ai_used,
                     "ai_web_discovery_used": discovery.ai_web_used,
                     "sitemap_count": discovery.sitemap_count,
                     "discovery_sources": discovery.source_counts,
-                    "updated_at": _now(),
                 }
-            )
+            batch = self.db.batch()
+            for index, page in enumerate(page_specs):
+                page_ref = job_ref.collection("pages").document(f"{index:03d}")
+                batch.set(
+                    page_ref,
+                    {
+                        "index": index,
+                        "url": page["url"],
+                        "title": page["title"],
+                        "source": page["source"],
+                        "status": "queued",
+                        "updated_at": _now(),
+                    },
+                )
+            batch.commit()
+            job_ref.update({**discovery_metadata, "updated_at": _now()})
             existing_pages = list(job_ref.collection("pages").stream())
 
         for snapshot in existing_pages:
@@ -751,6 +808,8 @@ class SiteAuditCoordinator:
         report = build_site_report(
             base_url=job["base_url"],
             model=job["model"],
+            audit_mode=str(job.get("audit_mode") or "crawl"),
+            source_file_name=str(job.get("source_file_name") or ""),
             capped=bool(job.get("capped")),
             candidate_count=int(job.get("candidate_count", len(pages))),
             pages=pages,
@@ -787,6 +846,7 @@ class SiteAuditCoordinator:
                 findings=report.total_findings,
                 download_url=download_url,
                 report_zip=report.zip_bytes,
+                audit_mode=str(job.get("audit_mode") or "crawl"),
             )
         except Exception as exc:
             job_ref.update(
@@ -838,6 +898,7 @@ class SiteAuditCoordinator:
             findings=int(job.get("total_findings", 0)),
             download_url=f"{self.service_url}/api/site-audits/{job_id}/report",
             report_zip=report_zip,
+            audit_mode=str(job.get("audit_mode") or "crawl"),
         )
         job_ref.update(
             {

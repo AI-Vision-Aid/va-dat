@@ -248,6 +248,18 @@ Serves the UI and the audit API from one process. Users can paste their own API
 key into the form instead of configuring one server-side; per-request keys take
 priority over the environment.
 
+The web app offers two asynchronous bulk-audit modes with the same model, API
+key, email, progress, consolidated findings, and token/cost reporting:
+
+- **Full Site — Crawl and Email** (default): starts with one public URL,
+  discovers same-site pages, and audits up to 200 pages.
+- **URL List — Batch and Email**: accepts a UTF-8/plain-text `.txt` file or a
+  Word `.docx` file containing up to 200 public HTTP(S) URLs. It deduplicates
+  the list and audits the supplied pages directly without crawling.
+
+The list upload is limited to 2 MB. Legacy `.doc` files are not supported;
+save them as `.docx` or plain text first.
+
 The audit endpoints stream **NDJSON** — progress events, one JSON object per
 line, then a final `{"type":"result"}` object. Parsing that body with a single
 `res.json()` fails; the front end branches on content type.

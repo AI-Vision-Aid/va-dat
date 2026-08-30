@@ -29,6 +29,10 @@ from vision_aid.site_audit.jobs import (
     validate_request_email,
 )
 from vision_aid.site_audit.report import build_site_report
+from vision_aid.site_audit.url_list import (
+    decode_uploaded_urls,
+    extract_uploaded_urls,
+)
 
 
 class CrawlerSafetyTests(unittest.TestCase):
@@ -183,6 +187,69 @@ class CrawlerSafetyTests(unittest.TestCase):
             html, _ = fetch_public_html("https://example.com/", session=session)
         self.assertIn("Real page", html)
         browser_fetch.assert_called_once()
+
+
+class UrlListUploadTests(unittest.TestCase):
+    def test_txt_extracts_deduplicates_and_canonicalizes_urls(self):
+        urls = extract_uploaded_urls(
+            "pages.txt",
+            (
+                "1. https://Example.com/about/?utm_source=test#team\n"
+                "2. https://example.com/about/\n"
+                "3. https://other.example.org/contact).\n"
+            ).encode("utf-8"),
+        )
+        self.assertEqual(
+            urls,
+            [
+                "https://example.com/about/",
+                "https://other.example.org/contact",
+            ],
+        )
+
+    def test_docx_extracts_visible_urls_and_hyperlink_targets(self):
+        document_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:body><w:p><w:r><w:t>https://example.com/one</w:t></w:r></w:p></w:body>
+        </w:document>"""
+        relationships_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" TargetMode="External"
+            Target="https://example.com/two?b=2&amp;a=1" />
+        </Relationships>"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("word/document.xml", document_xml)
+            archive.writestr("word/_rels/document.xml.rels", relationships_xml)
+        urls = extract_uploaded_urls("pages.docx", buffer.getvalue())
+        self.assertEqual(
+            urls,
+            [
+                "https://example.com/one",
+                "https://example.com/two?a=1&b=2",
+            ],
+        )
+
+    def test_more_than_200_unique_urls_is_rejected(self):
+        contents = "\n".join(
+            f"https://example.com/page/{index}" for index in range(201)
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "more than 200"):
+            extract_uploaded_urls("pages.txt", contents)
+
+    def test_private_literal_and_unsupported_files_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Private"):
+            extract_uploaded_urls("pages.txt", b"http://127.0.0.1/admin")
+        with self.assertRaisesRegex(ValueError, "credentials"):
+            extract_uploaded_urls("pages.txt", b"https://user:pass@example.com/admin")
+        with self.assertRaisesRegex(ValueError, "txt or .docx"):
+            extract_uploaded_urls("pages.pdf", b"https://example.com/")
+
+    def test_base64_upload_decodes_without_exposing_file_contents(self):
+        encoded = "aHR0cHM6Ly9leGFtcGxlLmNvbS8="
+        name, urls = decode_uploaded_urls("folder\\pages.txt", encoded)
+        self.assertEqual(name, "pages.txt")
+        self.assertEqual(urls, ["https://example.com/"])
 
 
 class EmailTests(unittest.TestCase):
@@ -346,6 +413,58 @@ class CredentialTests(unittest.TestCase):
         self.assertNotIn("saved-test-credential", repr(config))
 
 
+class JobCreationTests(unittest.TestCase):
+    def test_url_list_job_queues_direct_batch_metadata(self):
+        encryption_key = Fernet.generate_key().decode("ascii")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GOOGLE_CLOUD_PROJECT": "test-project",
+                "DAT_SERVICE_URL": "https://dat.example.com",
+                "DAT_REPORT_BUCKET": "test-bucket",
+                "DAT_JOB_TOKEN": "test-job-token",
+                "DAT_OPENAI_API_KEY": "saved-test-credential",
+                "DAT_CREDENTIAL_ENCRYPTION_KEY": encryption_key,
+                "DAT_ALLOWED_EMAIL_DOMAINS": "visionaid.org",
+                "DAT_MODEL": "gpt-5.6-sol",
+            },
+            clear=True,
+        ):
+            coordinator = SiteAuditCoordinator()
+        database = mock.Mock()
+        collection = database.collection.return_value
+        collection.where.return_value.limit.return_value.stream.return_value = []
+        job_ref = collection.document.return_value
+        coordinator._db = database
+        coordinator._dispatcher = mock.Mock()
+        uploaded = ["https://example.com/one", "https://other.example.org/two"]
+        with mock.patch.object(
+            coordinator,
+            "_verify_saved_key",
+            return_value=(True, "Verified"),
+        ), mock.patch(
+            "vision_aid.site_audit.jobs.validate_uploaded_urls",
+            return_value=uploaded,
+        ):
+            public = coordinator.create_job(
+                email="tester@visionaid.org",
+                model="gpt-5.6-sol",
+                audit_mode="url_list",
+                uploaded_urls=uploaded,
+                source_file_name="pages.txt",
+            )
+        stored = job_ref.set.call_args.args[0]
+        self.assertEqual(public["audit_mode"], "url_list")
+        self.assertEqual(public["candidate_count"], 2)
+        self.assertEqual(stored["provided_urls"], uploaded)
+        self.assertEqual(stored["base_url"], uploaded[0])
+        self.assertEqual(stored["source_file_name"], "pages.txt")
+        self.assertEqual(
+            coordinator._dispatcher.enqueue.call_args.args[0],
+            "/api/internal/site-audits/discover",
+        )
+
+
 class ProgressTests(unittest.TestCase):
     def test_public_job_reports_percentage_elapsed_time_and_eta(self):
         now = datetime(2026, 8, 29, 18, 0, tzinfo=timezone.utc)
@@ -413,6 +532,29 @@ class ReportTests(unittest.TestCase):
             usage_report = archive.read("DAT-token-and-cost-report.html")
             self.assertIn(b"1,500", usage_report)
             self.assertIn(b"$0.012345", usage_report)
+
+    def test_uploaded_url_list_report_identifies_direct_batch_mode(self):
+        report = build_site_report(
+            base_url="https://example.com/one",
+            model="gpt-5.6-sol",
+            audit_mode="url_list",
+            source_file_name="pages.txt",
+            capped=False,
+            candidate_count=2,
+            pages=[
+                {"url": "https://example.com/one", "status": "complete"},
+                {"url": "https://other.example.org/two", "status": "complete"},
+            ],
+            page_results=[],
+        )
+        self.assertIn(b"URL-List Batch Accessibility Audit Report", report.html_bytes)
+        self.assertIn(b"processed directly without crawling", report.html_bytes)
+        with zipfile.ZipFile(io.BytesIO(report.zip_bytes)) as archive:
+            summary = json.loads(archive.read("DAT-summary.json"))
+            usage = archive.read("DAT-token-and-cost-report.html")
+        self.assertEqual(summary["audit_mode"], "url_list")
+        self.assertEqual(summary["source_file_name"], "pages.txt")
+        self.assertIn(b"Uploaded URL list (pages.txt)", usage)
 
 
 if __name__ == "__main__":

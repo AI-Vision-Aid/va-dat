@@ -42,6 +42,7 @@ from vision_aid.ingestion.file_crawler import fetch_page, fetch_pages_nested  # 
 from processing_scripts.llm_client.client import is_openai_model, is_gemini_model  # noqa: E402
 from vision_aid.site_audit.crawler import validate_public_url  # noqa: E402
 from vision_aid.site_audit.jobs import get_coordinator  # noqa: E402
+from vision_aid.site_audit.url_list import decode_uploaded_urls  # noqa: E402
 
 
 # ── Multi-page splitting ─────────────────────────────────────────────────────
@@ -648,10 +649,10 @@ class AuditHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"valid": False, "error": str(exc)}, 400)
 
-    def _read_json_body(self) -> dict:
+    def _read_json_body(self, *, max_bytes: int = 64 * 1024) -> dict:
         """Read and parse one bounded JSON request body."""
         length = int(self.headers.get("Content-Length", 0))
-        if length <= 0 or length > 64 * 1024:
+        if length <= 0 or length > max_bytes:
             raise ValueError("A JSON request body is required")
         try:
             value = json.loads(self.rfile.read(length))
@@ -694,14 +695,25 @@ class AuditHandler(BaseHTTPRequestHandler):
         self._send_json({"success": True, "config": config})
 
     def _handle_create_site_audit(self):
-        """Create a durable whole-site audit and return immediately."""
+        """Create a durable crawl or uploaded URL-list audit and return immediately."""
         try:
-            data = self._read_json_body()
+            data = self._read_json_body(max_bytes=3 * 1024 * 1024)
+            audit_mode = str(data.get("audit_mode") or "crawl").strip().lower()
+            source_file_name = ""
+            uploaded_urls = None
+            if audit_mode == "url_list":
+                source_file_name, uploaded_urls = decode_uploaded_urls(
+                    data.get("url_file_name", ""),
+                    data.get("url_file_base64", ""),
+                )
             job = get_coordinator().create_job(
                 base_url=data.get("url", ""),
                 email=data.get("email", ""),
                 model=data.get("model", ""),
                 api_key=data.get("api_key", ""),
+                audit_mode=audit_mode,
+                uploaded_urls=uploaded_urls,
+                source_file_name=source_file_name,
             )
         except ValueError as exc:
             self._send_json({"success": False, "error": str(exc)}, 400)

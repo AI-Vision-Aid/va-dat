@@ -56,14 +56,35 @@ def _render_html(
     candidate_count: int,
     pages: list[dict],
     all_rows: list[dict[str, str]],
+    audit_mode: str,
+    source_file_name: str,
 ) -> bytes:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     total_succeeded = sum(1 for page in pages if page.get("status") == "complete")
     total_failed = sum(1 for page in pages if page.get("status") == "failed")
+    is_url_list = audit_mode == "url_list"
     cap_note = (
         "The 200-page safety cap was reached; remaining candidates were not audited."
         if capped
         else "All selected public pages were processed within the 200-page cap."
+    )
+    report_title = (
+        "URL-List Batch Accessibility Audit Report"
+        if is_url_list
+        else "Whole-Site Accessibility Audit Report"
+    )
+    scope_label = "First URL" if is_url_list else "Base URL"
+    source_line = (
+        f"<br><strong>Uploaded file:</strong> {html.escape(source_file_name)}"
+        if is_url_list and source_file_name
+        else ""
+    )
+    selection_note = (
+        f"<strong>Batch input:</strong> {candidate_count} unique URL(s) were supplied "
+        "and processed directly without crawling."
+        if is_url_list
+        else f"<strong>Discovery:</strong> {candidate_count} candidate URL(s) found. "
+        f"{html.escape(cap_note)}"
     )
 
     page_rows = []
@@ -108,7 +129,7 @@ def _render_html(
 
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Vision Aid DAT whole-site report</title>
+<title>Vision Aid DAT consolidated report</title>
 <style>
 body{{font-family:Arial,sans-serif;color:#172033;line-height:1.45;margin:0}}main{{max-width:1100px;margin:auto;padding:36px}}
 h1,h2{{color:#183f7a}}a{{color:#0b5cab;overflow-wrap:anywhere}}.cover{{min-height:90vh;page-break-after:always}}
@@ -118,13 +139,13 @@ th,td{{border:1px solid #bac7d8;padding:8px;vertical-align:top;text-align:left}}
 @media(max-width:700px){{.metrics{{grid-template-columns:1fr 1fr}}main{{padding:18px}}table{{display:block;overflow:auto}}}}
 @media print{{a{{color:inherit;text-decoration:none}}main{{max-width:none;padding:0}}}}
 </style></head><body><main>
-<section class="cover"><p>Vision Aid Digital Accessibility Testing</p><h1>Whole-Site Accessibility Audit Report</h1>
-<p><strong>Base URL:</strong> <a href="{html.escape(base_url)}">{html.escape(base_url)}</a><br>
+<section class="cover"><p>Vision Aid Digital Accessibility Testing</p><h1>{report_title}</h1>
+<p><strong>{scope_label}:</strong> <a href="{html.escape(base_url)}">{html.escape(base_url)}</a>{source_line}<br>
 <strong>Generated:</strong> {generated}<br><strong>Model:</strong> {html.escape(model)}</p>
 <div class="metrics"><div class="metric"><strong>{len(pages)}</strong>Pages selected</div>
 <div class="metric"><strong>{total_succeeded}</strong>Pages completed</div><div class="metric"><strong>{total_failed}</strong>Pages failed</div>
 <div class="metric"><strong>{len(all_rows)}</strong>Total findings</div></div>
-<p><strong>Discovery:</strong> {candidate_count} candidate URL(s) found. {html.escape(cap_note)}</p>
+<p>{selection_note}</p>
 <h2>Page Summary</h2><table><thead><tr><th>#</th><th>Page</th><th>Status</th><th>Issues</th><th>Summary</th></tr></thead>
 <tbody>{''.join(page_rows)}</tbody></table></section>
 {''.join(finding_sections)}
@@ -163,6 +184,8 @@ def _render_usage_report(
     base_url: str,
     model: str,
     page_results: list[dict],
+    audit_mode: str,
+    source_file_name: str,
 ) -> tuple[bytes, dict]:
     """Build a standalone human-readable token and estimated-cost report."""
     usage_rows = []
@@ -197,6 +220,12 @@ def _render_usage_report(
     ) or '<tr><td colspan="5">No model usage was recorded.</td></tr>'
     total_tokens = total_input + total_output
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    scope = (
+        f"Uploaded URL list ({source_file_name})"
+        if audit_mode == "url_list" and source_file_name
+        else ("Uploaded URL list" if audit_mode == "url_list" else base_url)
+    )
+    scope_label = "Input" if audit_mode == "url_list" else "Site"
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DAT token and cost report</title><style>
@@ -206,7 +235,7 @@ h1{{color:#183f7a}}.metrics{{display:grid;grid-template-columns:repeat(4,minmax(
 table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #bac7d8;padding:8px;text-align:left;vertical-align:top}}
 th{{background:#eef4fb}}a{{color:#0b5cab;overflow-wrap:anywhere}}@media(max-width:700px){{.metrics{{grid-template-columns:1fr 1fr}}}}
 </style></head><body><main><h1>Token and Estimated Cost Report</h1>
-<p><strong>Site:</strong> {html.escape(base_url)}<br><strong>Model:</strong> {html.escape(model)}<br>
+<p><strong>{scope_label}:</strong> {html.escape(scope)}<br><strong>Model:</strong> {html.escape(model)}<br>
 <strong>Generated:</strong> {generated}</p>
 <div class="metrics"><div class="metric"><strong>{total_input:,}</strong>Input tokens</div>
 <div class="metric"><strong>{total_output:,}</strong>Output tokens</div>
@@ -234,6 +263,8 @@ def build_site_report(
     candidate_count: int,
     pages: list[dict],
     page_results: list[dict],
+    audit_mode: str = "crawl",
+    source_file_name: str = "",
 ) -> SiteReport:
     """Build a printable HTML report and machine-readable CSV inside a ZIP."""
     results_by_url = {item.get("page_url", ""): item for item in page_results}
@@ -258,16 +289,22 @@ def build_site_report(
         candidate_count=candidate_count,
         pages=normalized_pages,
         all_rows=all_rows,
+        audit_mode=audit_mode,
+        source_file_name=source_file_name,
     )
     csv_bytes = _render_csv(all_rows)
     usage_html, usage = _render_usage_report(
         base_url=base_url,
         model=model,
         page_results=page_results,
+        audit_mode=audit_mode,
+        source_file_name=source_file_name,
     )
     summary_json = json.dumps(
         {
             "base_url": base_url,
+            "audit_mode": audit_mode,
+            "source_file_name": source_file_name,
             "model": model,
             "pages_selected": len(normalized_pages),
             "pages_completed": sum(1 for page in normalized_pages if page.get("status") == "complete"),

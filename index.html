@@ -301,8 +301,8 @@
             <div class="accent-bar" aria-hidden="true"></div>
             <h2 id="audit-heading">Accessibility Audit Tool</h2>
             <p>
-              Provide an HTML file, or enter a URL to fetch and audit — with
-              optional recursive crawling of nested pages.
+              Audit one page, crawl an entire site, or upload a list of up to
+              200 URLs for asynchronous batch processing and email delivery.
             </p>
           </div>
 
@@ -316,7 +316,7 @@
               <p class="audit-mode-label" id="auditModeLabel">Input type</p>
               <div class="audit-mode-tabs">
                 <label class="audit-mode-tab">
-                  <input type="radio" name="auditMode" value="html" checked />
+                  <input type="radio" name="auditMode" value="html" />
                   <span>HTML File</span>
                 </label>
                 <label class="audit-mode-tab">
@@ -328,14 +328,18 @@
                   <span>URL &#8212; With Crawl</span>
                 </label>
                 <label class="audit-mode-tab">
-                  <input type="radio" name="auditMode" value="site" />
-                  <span>Entire Site &#8212; Email Report</span>
+                  <input type="radio" name="auditMode" value="site" checked />
+                  <span>Full Site &#8212; Crawl and Email</span>
+                </label>
+                <label class="audit-mode-tab">
+                  <input type="radio" name="auditMode" value="url-list" />
+                  <span>URL List &#8212; Batch and Email</span>
                 </label>
               </div>
             </div>
 
             <!-- HTML file input -->
-            <div id="htmlInputSection">
+            <div id="htmlInputSection" hidden>
               <div class="form-group">
                 <label for="fileInput"
                   >HTML File
@@ -440,7 +444,7 @@
             <!-- /#htmlInputSection -->
 
             <!-- URL input -->
-            <div id="urlInputSection" hidden>
+            <div id="urlInputSection">
               <div class="form-group">
                 <label for="urlInput"
                   >URL <span class="required-mark" aria-hidden="true">*</span
@@ -469,7 +473,27 @@
               </div>
             </div>
 
-            <div id="siteEmailSection" hidden>
+            <div id="urlListInputSection" hidden>
+              <div class="form-group">
+                <label for="urlListFileInput">URL-list file
+                  <span class="required-mark" aria-hidden="true">*</span>
+                  <span class="sr-only">(required)</span>
+                </label>
+                <input type="file" id="urlListFileInput" name="url_list_file"
+                  accept=".txt,.docx"
+                  aria-describedby="urlListFileHint urlListFileError" />
+                <p class="field-hint" id="urlListFileHint">
+                  Upload a UTF-8 text file or Word .docx file containing up to
+                  200 public http:// or https:// URLs. Duplicate URLs are removed,
+                  and pages are processed directly without crawling.
+                </p>
+                <p class="field-hint" id="urlListFileSelection" hidden></p>
+                <p class="form-error" id="urlListFileError" role="alert"
+                  aria-live="assertive" hidden></p>
+              </div>
+            </div>
+
+            <div id="siteEmailSection">
               <div class="form-group">
                 <label for="siteEmailInput">Report email
                   <span class="required-mark" aria-hidden="true">*</span>
@@ -479,7 +503,9 @@
                   placeholder="name@visionaid.org" autocomplete="email"
                   aria-describedby="siteEmailHint siteEmailError" />
                 <p class="field-hint" id="siteEmailHint">
-                  You may close this page after submission. The printable report and CSV will be emailed when the crawl finishes.
+                  You may close this page after submission. The consolidated
+                  report, findings, and token/cost details will be available
+                  when processing finishes, and the download link will be emailed.
                 </p>
                 <p class="form-error" id="siteEmailError" role="alert" aria-live="assertive" hidden></p>
               </div>
@@ -581,7 +607,7 @@
                     </option>
                   </optgroup>
                   <optgroup label="OpenAI">
-                    <option value="gpt-5.6-sol">
+                    <option value="gpt-5.6-sol" selected>
                       GPT-5.6 Sol — flagship reasoning
                     </option>
                     <option value="gpt-4o-mini">
@@ -606,7 +632,7 @@
             </div>
 
             <button type="submit" class="audit-btn" id="auditSubmitBtn">
-              Run Audit
+              Queue Full-Site Audit
             </button>
             <p class="sr-only" id="auditStatus" role="status"></p>
           </form>
@@ -858,40 +884,52 @@
       // Input mode switching
       const htmlInputSection = document.getElementById("htmlInputSection");
       const urlInputSection = document.getElementById("urlInputSection");
+      const urlListInputSection = document.getElementById("urlListInputSection");
       const siteEmailSection = document.getElementById("siteEmailSection");
       const modelKeySection = document.getElementById("modelKeySection");
       const urlInputHint = document.getElementById("urlInputHint");
-
-      document.querySelectorAll('input[name="auditMode"]').forEach((radio) => {
-        radio.addEventListener("change", () => {
-          const isHtml = radio.value === "html";
-          const isSite = radio.value === "site";
-          htmlInputSection.hidden = !isHtml;
-          urlInputSection.hidden = isHtml;
-          siteEmailSection.hidden = !isSite;
-          modelKeySection.hidden = false;
-          if (isSite) {
-            modelSelect.value = siteAuditConfig.model || "gpt-5.6-sol";
-            apiKeyInput.value = "";
-            updateApiKeyField();
-            loadSiteAuditConfig(modelSelect.value, false);
-          } else {
-            updateApiKeyField();
-            apiKeyValidateStatus.hidden = true;
-          }
-          document.getElementById("auditSubmitBtn").textContent = isSite
-            ? "Queue Whole-Site Audit"
-            : "Run Audit";
-          urlInputHint.innerHTML = isSite
-            ? "The crawler uses sitemaps, internal links, and GPT-5.6 Sol to identify and audit up to 200 public pages."
-            : "The server fetches and audits this page. <em>URL — With Crawl</em> also follows in-domain links up to one level deep (max&nbsp;10 links per page).";
-        });
-      });
 
       function getAuditMode() {
         return document.querySelector('input[name="auditMode"]:checked').value;
       }
 
+      function submitButtonLabel(mode = getAuditMode()) {
+        if (mode === "site") return "Queue Full-Site Audit";
+        if (mode === "url-list") return "Queue URL-List Audit";
+        return "Run Audit";
+      }
+
+      function applyAuditMode(mode) {
+        const isHtml = mode === "html";
+        const isFullSite = mode === "site";
+        const isUrlList = mode === "url-list";
+        const isBulk = isFullSite || isUrlList;
+        htmlInputSection.hidden = !isHtml;
+        urlInputSection.hidden = !(mode === "url" || mode === "url-nested" || isFullSite);
+        urlListInputSection.hidden = !isUrlList;
+        siteEmailSection.hidden = !isBulk;
+        modelKeySection.hidden = false;
+        if (isBulk) {
+          modelSelect.value = siteAuditConfig.model || "gpt-5.6-sol";
+          apiKeyInput.value = "";
+          updateApiKeyField();
+          loadSiteAuditConfig(modelSelect.value, false);
+        } else {
+          updateApiKeyField();
+          apiKeyValidateStatus.hidden = true;
+        }
+        document.getElementById("auditSubmitBtn").textContent =
+          submitButtonLabel(mode);
+        urlInputHint.innerHTML = isFullSite
+          ? "The crawler uses sitemaps, internal links, and GPT-5.6 Sol to identify and audit up to 200 public pages."
+          : "The server fetches and audits this page. <em>URL — With Crawl</em> also follows in-domain links up to one level deep (max&nbsp;10 links per page).";
+      }
+
+      document.querySelectorAll('input[name="auditMode"]').forEach((radio) => {
+        radio.addEventListener("change", () => applyAuditMode(radio.value));
+      });
+
+      applyAuditMode(getAuditMode());
       loadSiteAuditConfig();
 
       // ── Drag-and-drop / file input ────────────────────────────────────────────
@@ -906,6 +944,10 @@
       const dropFilename = document.getElementById("dropFilename");
       const dropFilesize = document.getElementById("dropFilesize");
       const fileError = document.getElementById("fileError");
+      const urlListFileInput = document.getElementById("urlListFileInput");
+      const urlListFileError = document.getElementById("urlListFileError");
+      const urlListFileSelection = document.getElementById("urlListFileSelection");
+      let urlListFile = null;
 
       function showError(msg) {
         fileError.hidden = false;
@@ -950,10 +992,68 @@
         return (n / (1024 * 1024)).toFixed(1) + " MB";
       }
 
+      function clearUrlListFileError() {
+        urlListFileError.hidden = true;
+        urlListFileError.textContent = "";
+      }
+
+      function showUrlListFileError(message) {
+        urlListFileError.hidden = false;
+        urlListFileError.textContent = message;
+      }
+
+      function selectUrlListFile(file) {
+        clearUrlListFileError();
+        if (!file || !file.name.match(/\.(txt|docx)$/i)) {
+          urlListFile = null;
+          urlListFileInput.value = "";
+          urlListFileSelection.hidden = true;
+          showUrlListFileError("Please select a .txt or .docx file.");
+          return;
+        }
+        if (file.size > 2 * 1024 * 1024) {
+          urlListFile = null;
+          urlListFileInput.value = "";
+          urlListFileSelection.hidden = true;
+          showUrlListFileError("The URL-list file must be 2 MB or smaller.");
+          return;
+        }
+        urlListFile = file;
+        urlListFileSelection.textContent =
+          `Selected: ${file.name} (${formatBytes(file.size)})`;
+        urlListFileSelection.hidden = false;
+      }
+
+      function fileAsBase64(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const value = String(reader.result || "");
+            const comma = value.indexOf(",");
+            if (comma < 0) {
+              reject(new Error("The selected URL-list file could not be read."));
+              return;
+            }
+            resolve(value.slice(comma + 1));
+          };
+          reader.onerror = () =>
+            reject(new Error("The selected URL-list file could not be read."));
+          reader.readAsDataURL(file);
+        });
+      }
+
       browseBtn.addEventListener("click", () => fileInput.click());
       fileClearBtn.addEventListener("click", clearFile);
       fileInput.addEventListener("change", () => {
         if (fileInput.files[0]) loadFile(fileInput.files[0]);
+      });
+      urlListFileInput.addEventListener("change", () => {
+        if (urlListFileInput.files[0]) {
+          selectUrlListFile(urlListFileInput.files[0]);
+        } else {
+          urlListFile = null;
+          urlListFileSelection.hidden = true;
+        }
       });
 
       dropZone.addEventListener("keydown", (e) => {
@@ -981,7 +1081,12 @@
         .addEventListener("dragover", (e) => e.preventDefault());
       document.getElementById("auditTool").addEventListener("drop", (e) => {
         e.preventDefault();
-        if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+        if (!e.dataTransfer.files[0]) return;
+        if (getAuditMode() === "url-list") {
+          selectUrlListFile(e.dataTransfer.files[0]);
+        } else if (getAuditMode() === "html") {
+          loadFile(e.dataTransfer.files[0]);
+        }
       });
 
       // ── Audit form submission ─────────────────────────────────────────────────
@@ -992,6 +1097,7 @@
                 clearError();
                 const _urlErr = document.getElementById("urlError");
                 const _emailErr = document.getElementById("siteEmailError");
+                clearUrlListFileError();
                 if (_urlErr) {
                   _urlErr.hidden = true;
                   _urlErr.textContent = "";
@@ -1029,6 +1135,31 @@
                     [keyField]: keyValue,
                     model,
                   };
+                } else if (mode === "url-list") {
+                  if (!urlListFile) {
+                    showUrlListFileError(
+                      "Please select a .txt or .docx file containing URLs."
+                    );
+                    urlListFileInput.focus();
+                    return;
+                  }
+                  const email = document.getElementById("siteEmailInput").value.trim();
+                  if (!email) {
+                    _emailErr.textContent =
+                      "Please enter the email address that should receive the report.";
+                    _emailErr.hidden = false;
+                    document.getElementById("siteEmailInput").focus();
+                    return;
+                  }
+                  endpoint = "/api/site-audits";
+                  requestBody = {
+                    audit_mode: "url_list",
+                    url_file_name: urlListFile.name,
+                    url_file_base64: await fileAsBase64(urlListFile),
+                    email,
+                    model,
+                  };
+                  if (keyValue) requestBody.api_key = keyValue;
                 } else {
                   const urlVal = document.getElementById("urlInput").value.trim();
                   if (!urlVal) {
@@ -1048,7 +1179,12 @@
                       return;
                     }
                     endpoint = "/api/site-audits";
-                    requestBody = { url: urlVal, email, model };
+                    requestBody = {
+                      audit_mode: "crawl",
+                      url: urlVal,
+                      email,
+                      model,
+                    };
                     if (keyValue) requestBody.api_key = keyValue;
                   } else {
                     endpoint =
@@ -1072,10 +1208,15 @@
 
                 // Show progress bar for all audit modes
                 const isNested = mode === "url-nested";
-                const isAsyncSite = mode === "site";
-                const initialMsg = isAsyncSite
-                  ? "Queueing whole-site audit\u2026"
+                const isAsyncBulk = mode === "site" || mode === "url-list";
+                const initialMsg = mode === "url-list"
+                  ? "Uploading URL list and queueing batch audit\u2026"
+                  : isAsyncBulk
+                  ? "Queueing full-site audit\u2026"
                   : (isNested ? "Crawling pages\u2026" : "Starting audit\u2026");
+                const initialDetail = mode === "url-list"
+                  ? "Validating the uploaded URLs..."
+                  : "Analyzing site structure...";
                 resultsSection.style.display = "block";
 
                 // Set up the UI for the wait
@@ -1085,7 +1226,7 @@
         <div class="progress-bar-track">
           <div class="progress-bar-fill" id="progressFill" style="width: 10%"></div>
         </div>
-        <p class="progress-detail" id="progressDetail">Analyzing site structure...</p>
+        <p class="progress-detail" id="progressDetail">${initialDetail}</p>
       </div>
       <p class="sr-only" id="progressStatus" role="status" aria-live="polite">Audit started</p>`;
 
@@ -1114,7 +1255,7 @@
                     throw new Error(`Server Error: ${res.status} - ${errorText}`);
                   }
 
-                  if (isAsyncSite) {
+                  if (isAsyncBulk) {
                     clearInterval(progressInterval);
                     const queued = await res.json();
                     if (!queued.success || !queued.job) {
@@ -1123,7 +1264,9 @@
                     renderSiteJob(content, queued.job);
                     pollSiteJob(content, queued.job.job_id);
                     document.getElementById("auditStatus").textContent =
-                      "Whole-site audit queued. The report will be emailed when ready.";
+                      mode === "url-list"
+                        ? "URL-list batch audit queued. The report will be emailed when ready."
+                        : "Full-site audit queued. The report will be emailed when ready.";
                     return;
                   }
 
@@ -1178,9 +1321,7 @@
                   resultsSection.style.display = "block";
                 } finally {
                   submitBtn.disabled = false;
-                  submitBtn.textContent = getAuditMode() === "site"
-                    ? "Queue Whole-Site Audit"
-                    : "Run Audit";
+                  submitBtn.textContent = submitButtonLabel();
                 }
               });
 
@@ -1195,12 +1336,14 @@
       }
 
       function renderSiteJob(container, job) {
+        const isUrlList = job.audit_mode === "url_list";
         const finished = (job.pages_completed || 0) + (job.pages_failed || 0);
         const total = job.pages_total || 0;
         const pct = job.progress_percent || 0;
         const labels = {
           queued: "Queued",
           discovering: "Discovering site pages",
+          preparing: "Preparing uploaded URL list",
           auditing: "Auditing pages",
           finalizing: "Building and emailing report",
           complete: "Complete",
@@ -1214,10 +1357,16 @@
           details.push(`${finished} of ${total} pages processed`);
           details.push(`${job.pages_completed || 0} successful`);
           if (job.pages_failed) details.push(`${job.pages_failed} failed`);
+        } else if (job.status === "preparing") {
+          details.push("Validating and preparing the uploaded URLs without crawling…");
         } else if (job.status === "discovering") {
           details.push("Checking sitemaps, site links, CMS records, and web search…");
         } else {
-          details.push("Waiting to begin page discovery…");
+          details.push(
+            isUrlList
+              ? "Waiting to prepare the uploaded URL list…"
+              : "Waiting to begin page discovery…"
+          );
         }
         if (job.elapsed_seconds != null) {
           details.push(`Elapsed: ${formatDuration(job.elapsed_seconds)}`);
@@ -1226,7 +1375,11 @@
           details.push(`Estimated remaining: ${formatDuration(job.estimated_seconds_remaining)}`);
         }
         if (job.candidate_count) {
-          details.push(`${job.candidate_count} public page candidates found`);
+          details.push(
+            isUrlList
+              ? `${job.candidate_count} unique URLs supplied`
+              : `${job.candidate_count} public page candidates found`
+          );
         }
         const deliveryNotice = job.email_delivery_status === "accepted"
           ? `<p><strong>Email submitted successfully.</strong> The mail server accepted it${job.email_accepted_at ? ` at ${esc(new Date(job.email_accepted_at).toLocaleString())}` : ""}.</p>`
@@ -1237,7 +1390,7 @@
         container.innerHTML = `
           <div class="audit-progress">
             <p class="progress-message"><strong>${esc(labels[job.status] || job.status)}</strong> — ${pct}%</p>
-            <div class="progress-bar-track" role="progressbar" aria-label="Whole-site audit progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
+            <div class="progress-bar-track" role="progressbar" aria-label="Batch audit progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
             <p class="progress-detail">${details.map(esc).join(" • ")}</p>
           </div>
           <p>You may close this page. The report will be emailed when complete.</p>
