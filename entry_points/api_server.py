@@ -383,6 +383,14 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         return send_event
 
+    @staticmethod
+    def _record_sync_usage(**kwargs) -> None:
+        """Record privacy-safe usage totals without making an audit depend on telemetry."""
+        try:
+            get_coordinator().record_usage_event(**kwargs)
+        except Exception as exc:
+            print(f"  Usage event recording failed ({type(exc).__name__})")
+
     def _handle_audit(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -415,6 +423,11 @@ class AuditHandler(BaseHTTPRequestHandler):
             "message": "Starting audit…",
         })
         result = run_audit(html_content, api_key, model, progress_callback=send_event)
+        self._record_sync_usage(
+            audit_mode="html_upload",
+            model=model,
+            result=result,
+        )
         result["type"] = "result"
         send_event(result)
 
@@ -458,6 +471,12 @@ class AuditHandler(BaseHTTPRequestHandler):
                 html_content = fetch_page(url)
             except Exception as exc:
                 result = {"type": "result", "success": False, "error": f"Failed to fetch URL: {exc}"}
+                self._record_sync_usage(
+                    audit_mode="single_url",
+                    model=model,
+                    result=result,
+                    base_url=url,
+                )
                 send_event(result)
                 return
             print(f"  [url_audit] Fetched {len(html_content):,} chars from {url}")
@@ -472,6 +491,12 @@ class AuditHandler(BaseHTTPRequestHandler):
                 "message": "Page fetched — starting analysis…",
             })
             result = run_audit(html_content, api_key, model, progress_callback=send_event)
+            self._record_sync_usage(
+                audit_mode="single_url",
+                model=model,
+                result=result,
+                base_url=url,
+            )
             result["type"] = "result"
             send_event(result)
             return
@@ -480,6 +505,12 @@ class AuditHandler(BaseHTTPRequestHandler):
         try:
             html_content, crawl_tree = fetch_pages_nested(url)
         except Exception as exc:
+            self._record_sync_usage(
+                audit_mode="legacy_crawl",
+                model=model,
+                result={"success": False},
+                base_url=url,
+            )
             self._send_json({"success": False, "error": f"Failed to fetch URL: {exc}"}, 502)
             return
 
@@ -613,6 +644,15 @@ class AuditHandler(BaseHTTPRequestHandler):
             merged["csv_report"] = "\n".join(csv_parts) + "\n"
 
         # Final event: the full merged result
+        self._record_sync_usage(
+            audit_mode="legacy_crawl",
+            model=model,
+            result=merged,
+            base_url=url,
+            pages_total=total_pages,
+            pages_completed=len(merged["pages_audited"]),
+            pages_failed=total_pages - len(merged["pages_audited"]),
+        )
         merged["type"] = "result"
         _send_event(merged)
 

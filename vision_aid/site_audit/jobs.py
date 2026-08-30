@@ -320,6 +320,9 @@ class SiteAuditCoordinator:
             if item.strip()
         }
         self.collection = os.getenv("DAT_JOB_COLLECTION", "dat_site_audit_jobs")
+        self.usage_collection = os.getenv(
+            "DAT_USAGE_COLLECTION", "dat_audit_usage_events"
+        )
         self.monitor_collection = os.getenv(
             "DAT_MONITOR_COLLECTION", "dat_site_audit_monitor_runs"
         )
@@ -444,6 +447,62 @@ class SiteAuditCoordinator:
 
     def _monitor_ref(self, report_date: str):
         return self.db.collection(self.monitor_collection).document(report_date)
+
+    def record_usage_event(
+        self,
+        *,
+        audit_mode: str,
+        model: str,
+        result: dict,
+        base_url: str = "",
+        pages_total: int = 1,
+        pages_completed: int | None = None,
+        pages_failed: int | None = None,
+    ) -> None:
+        """Persist non-sensitive usage totals for synchronous audit modes."""
+        if not self.project:
+            return
+        success = bool(result.get("success"))
+        total = max(0, int(pages_total))
+        completed = (
+            max(0, int(pages_completed))
+            if pages_completed is not None
+            else (total if success else 0)
+        )
+        failed = (
+            max(0, int(pages_failed))
+            if pages_failed is not None
+            else (0 if success else total)
+        )
+        summary = result.get("summary") or {}
+        parsed = urlparse(str(base_url or ""))
+        host = (parsed.hostname or "").lower()
+        origin = f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else ""
+        event_id = secrets.token_urlsafe(18)
+        now = _now()
+        self.db.collection(self.usage_collection).document(event_id).set(
+            {
+                "event_id": event_id,
+                "audit_mode": str(audit_mode),
+                "base_url": origin,
+                "site_hosts": [host] if host else [],
+                "status": "complete" if success else "failed",
+                "model": str(model or "unknown"),
+                "pages_total": total,
+                "pages_completed": completed,
+                "pages_failed": failed,
+                "total_input_tokens": max(
+                    0, int(summary.get("total_input_tokens") or 0)
+                ),
+                "total_output_tokens": max(
+                    0, int(summary.get("total_output_tokens") or 0)
+                ),
+                "estimated_cost_usd": summary.get("estimated_cost_usd"),
+                "created_at": now,
+                "updated_at": now,
+                "expires_at": now + timedelta(days=30),
+            }
+        )
 
     def internal_token_valid(self, supplied: str) -> bool:
         return bool(self.job_token and hmac.compare_digest(self.job_token, supplied or ""))
@@ -1053,6 +1112,12 @@ class SiteAuditCoordinator:
                 .stream()
             )
             jobs = [snapshot.to_dict() for snapshot in snapshots]
+            usage_snapshots = (
+                self.db.collection(self.usage_collection)
+                .where(filter=FieldFilter("updated_at", ">=", window_start))
+                .stream()
+            )
+            jobs.extend(snapshot.to_dict() for snapshot in usage_snapshots)
             checks["firestore"] = True
         except Exception as exc:
             issues.append(f"The audit job database check failed ({type(exc).__name__}).")
@@ -1116,7 +1181,11 @@ class SiteAuditCoordinator:
                 1
                 for job in jobs
                 if str(job.get("last_error") or "").startswith("Email delivery failed")
-                or (job.get("status") == "complete" and not job.get("email_sent"))
+                or (
+                    job.get("audit_mode") in {"crawl", "url_list"}
+                    and job.get("status") == "complete"
+                    and not job.get("email_sent")
+                )
             )
             if email_failures:
                 issues.append(

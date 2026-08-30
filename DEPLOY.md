@@ -23,6 +23,7 @@ environment variables below, attach a domain, and deploy.
 | `HOST_PORT` | No | Local-only: host port for `docker compose up` (default 8000) |
 | `DAT_DAILY_MONITOR_EMAIL` | For daily monitoring | Recipient for the 24-hour usage and health report |
 | `DAT_MONITOR_COLLECTION` | No | Firestore monitor-run collection; defaults to `dat_site_audit_monitor_runs` |
+| `DAT_USAGE_COLLECTION` | No | Privacy-safe synchronous-audit usage events; defaults to `dat_audit_usage_events` |
 
 **No provider API keys are configured, deliberately.** Each user pastes their
 own key into the web form, so the deployment never bills a shared account.
@@ -103,11 +104,14 @@ writing temp files.
 ## Daily DAT usage and health monitor
 
 The authenticated endpoint `POST /api/internal/site-audits/daily-monitor`
-collects background audits active during the preceding 24 hours. It reports
+collects audits active during the preceding 24 hours. It reports
 each scanned site, mode, status, model, pages processed, page failures, and
 estimated AI cost. It also checks the public health endpoint, Firestore, report
 storage, background-audit configuration, the saved model credential, email
 configuration, and jobs that have stopped progressing for more than six hours.
+Synchronous modes store only operational totals (site host when available,
+model, status, token totals, estimated cost, and page counts), never uploaded
+HTML, provider credentials, or requester information.
 
 Cloud Scheduler should call the endpoint at 6:00 a.m. in the
 `America/New_York` timezone. Use the same Secret Manager value already supplied

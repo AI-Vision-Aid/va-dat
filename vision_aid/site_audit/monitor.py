@@ -19,6 +19,8 @@ def _utc(value: datetime | None) -> datetime | None:
 
 
 def _site_label(job: dict) -> str:
+    if job.get("audit_mode") == "html_upload":
+        return "Uploaded HTML (site not supplied)"
     hosts = [str(item).strip().lower() for item in job.get("site_hosts", []) if item]
     if not hosts:
         host = (urlparse(str(job.get("base_url") or "")).hostname or "").lower()
@@ -73,9 +75,12 @@ def build_daily_monitor_report(
         rows.append(
             {
                 "site": _site_label(job),
-                "mode": "Uploaded URL list"
-                if job.get("audit_mode") == "url_list"
-                else "Full-site crawl",
+                "mode": {
+                    "url_list": "Uploaded URL list",
+                    "single_url": "Single-page URL",
+                    "html_upload": "Uploaded HTML",
+                    "legacy_crawl": "Legacy nested crawl",
+                }.get(str(job.get("audit_mode") or "crawl"), "Full-site crawl"),
                 "status": str(job.get("status") or "unknown"),
                 "pages_processed": pages_processed,
                 "pages_total": max(0, int(job.get("pages_total") or 0)),

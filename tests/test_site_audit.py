@@ -608,6 +608,57 @@ class DailyMonitorTests(unittest.TestCase):
         self.assertEqual(error["health_status"], "error")
         self.assertIn("NOT WORKING", error["text"])
 
+    def test_synchronous_usage_event_omits_content_credentials_and_url_path(self):
+        coordinator = SiteAuditCoordinator()
+        coordinator.project = "test-project"
+        database = mock.Mock()
+        coordinator._db = database
+        coordinator.record_usage_event(
+            audit_mode="single_url",
+            model="gpt-4.1",
+            base_url="https://example.com/private/path?token=do-not-store",
+            result={
+                "success": True,
+                "api_key": "do-not-store",
+                "csv_report": "private report contents",
+                "summary": {
+                    "total_input_tokens": 100,
+                    "total_output_tokens": 20,
+                    "estimated_cost_usd": 0.0123,
+                },
+            },
+        )
+        stored = (
+            database.collection.return_value.document.return_value.set.call_args.args[0]
+        )
+        self.assertEqual(stored["base_url"], "https://example.com/")
+        self.assertEqual(stored["site_hosts"], ["example.com"])
+        self.assertEqual(stored["pages_completed"], 1)
+        self.assertEqual(stored["estimated_cost_usd"], 0.0123)
+        self.assertNotIn("do-not-store", repr(stored))
+        self.assertNotIn("private report contents", repr(stored))
+
+    def test_uploaded_html_usage_is_identified_without_inventing_a_site(self):
+        report = build_daily_monitor_report(
+            jobs=[
+                {
+                    "audit_mode": "html_upload",
+                    "status": "complete",
+                    "model": "gpt-4.1",
+                    "pages_total": 1,
+                    "pages_completed": 1,
+                    "estimated_cost_usd": 0.05,
+                    "created_at": self.window_start + timedelta(hours=1),
+                }
+            ],
+            window_start=self.window_start,
+            window_end=self.window_end,
+            checks=self.healthy_checks,
+            issues=[],
+        )
+        self.assertIn("Uploaded HTML (site not supplied)", report["text"])
+        self.assertIn("Mode: Uploaded HTML", report["text"])
+
     def test_live_checks_use_object_access_instead_of_bucket_metadata(self):
         coordinator = SiteAuditCoordinator()
         coordinator.project = "test-project"
