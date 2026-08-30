@@ -22,6 +22,7 @@ dependencies = [
     "requests>=2.32.2",
     "curl-cffi>=0.14.0",
     "playwright>=1.55.0",
+    "tzdata>=2025.2; platform_system == 'Windows'",
 ]
 
 [tool.setuptools]

@@ -8,6 +8,7 @@ import os
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 from cryptography.fernet import Fernet
@@ -25,14 +26,27 @@ from vision_aid.site_audit.crawler import (
 )
 from vision_aid.site_audit.jobs import (
     SiteAuditCoordinator,
+    send_daily_monitor_email,
     send_report_email,
     validate_request_email,
 )
+from vision_aid.site_audit.monitor import build_daily_monitor_report
 from vision_aid.site_audit.report import build_site_report
 from vision_aid.site_audit.url_list import (
     decode_uploaded_urls,
     extract_uploaded_urls,
 )
+
+
+class AuditModeUiTests(unittest.TestCase):
+    def test_obsolete_nested_crawl_option_is_not_offered(self):
+        html = (Path(__file__).resolve().parents[1] / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn('value="url-nested"', html)
+        self.assertNotIn("URL &#8212; With Crawl", html)
+        self.assertIn('value="site" checked', html)
+        self.assertIn("Full Site &#8212; Crawl and Email", html)
 
 
 class CrawlerSafetyTests(unittest.TestCase):
@@ -368,6 +382,35 @@ class EmailTests(unittest.TestCase):
                 report_zip=b"zip",
             )
 
+    def test_daily_monitor_email_uses_requested_recipient_and_fallback(self):
+        smtp = mock.Mock()
+        smtp.send_message.return_value = {}
+        smtp_context = mock.Mock()
+        smtp_context.__enter__ = mock.Mock(return_value=smtp)
+        smtp_context.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SMTP_HOST": "smtp.office365.com",
+                "SMTP_PORT": "587",
+                "SMTP_USER": "abilitybazaar@visionaid.org",
+                "SMTP_PASSWORD": "secret",
+                "SMTP_FROM": "abilitybazaar@visionaid.org",
+                "DAT_SMTP_SELF_DELIVERY_FALLBACK": "ram@visionaid.org",
+            },
+        ), mock.patch(
+            "vision_aid.site_audit.jobs.smtplib.SMTP", return_value=smtp_context
+        ):
+            receipt = send_daily_monitor_email(
+                recipient="abilitybazaar@visionaid.org",
+                report={"subject": "DAT daily monitor", "text": "Working OK\n"},
+            )
+        message = smtp.send_message.call_args.args[0]
+        self.assertEqual(message["To"], "abilitybazaar@visionaid.org")
+        self.assertEqual(message["Cc"], "ram@visionaid.org")
+        self.assertIn("Working OK", message.get_content())
+        self.assertEqual(receipt["accepted_recipient_count"], 2)
+
 
 class CredentialTests(unittest.TestCase):
     def test_override_is_encrypted_and_decrypted_only_for_the_job(self):
@@ -485,6 +528,113 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(public["pages_remaining"], 6)
         self.assertEqual(public["elapsed_seconds"], 120)
         self.assertEqual(public["estimated_seconds_remaining"], 180)
+
+
+class DailyMonitorTests(unittest.TestCase):
+    def setUp(self):
+        self.window_end = datetime(2026, 8, 30, 10, 0, tzinfo=timezone.utc)
+        self.window_start = self.window_end - timedelta(hours=24)
+        self.healthy_checks = {
+            "service_endpoint": True,
+            "core_configuration": True,
+            "firestore": True,
+            "report_storage": True,
+            "saved_model_key": True,
+            "email_configuration": True,
+        }
+
+    def test_daily_report_lists_sites_pages_cost_and_healthy_status(self):
+        report = build_daily_monitor_report(
+            jobs=[
+                {
+                    "base_url": "https://dat.visionaid.org/",
+                    "site_hosts": ["dat.visionaid.org"],
+                    "audit_mode": "crawl",
+                    "status": "complete",
+                    "model": "gpt-5.6-sol",
+                    "pages_total": 26,
+                    "pages_completed": 25,
+                    "pages_failed": 1,
+                    "estimated_cost_usd": 1.234567,
+                    "created_at": self.window_start + timedelta(hours=2),
+                },
+                {
+                    "base_url": "https://example.com/one",
+                    "site_hosts": ["example.com", "other.example.org"],
+                    "audit_mode": "url_list",
+                    "status": "complete",
+                    "model": "gpt-4.1",
+                    "pages_total": 2,
+                    "pages_completed": 2,
+                    "pages_failed": 0,
+                    "estimated_cost_usd": 0.1,
+                    "created_at": self.window_start + timedelta(hours=3),
+                },
+            ],
+            window_start=self.window_start,
+            window_end=self.window_end,
+            checks=self.healthy_checks,
+            issues=[],
+        )
+        self.assertEqual(report["health_status"], "ok")
+        self.assertEqual(report["audit_count"], 2)
+        self.assertEqual(report["pages_processed"], 28)
+        self.assertEqual(report["pages_failed"], 1)
+        self.assertEqual(report["estimated_cost_usd"], 1.334567)
+        self.assertIn("dat.visionaid.org", report["text"])
+        self.assertIn("example.com, other.example.org", report["text"])
+        self.assertIn("$1.234567", report["text"])
+
+    def test_health_issue_is_warning_and_failed_check_is_error(self):
+        warning = build_daily_monitor_report(
+            jobs=[],
+            window_start=self.window_start,
+            window_end=self.window_end,
+            checks=self.healthy_checks,
+            issues=["One page failed."],
+        )
+        self.assertEqual(warning["health_status"], "warning")
+        self.assertIn("WORKING WITH ISSUES", warning["subject"])
+
+        failed_checks = dict(self.healthy_checks)
+        failed_checks["report_storage"] = False
+        error = build_daily_monitor_report(
+            jobs=[],
+            window_start=self.window_start,
+            window_end=self.window_end,
+            checks=failed_checks,
+            issues=["Storage unavailable."],
+        )
+        self.assertEqual(error["health_status"], "error")
+        self.assertIn("NOT WORKING", error["text"])
+
+    def test_sent_report_is_not_emailed_twice_for_same_eastern_date(self):
+        coordinator = SiteAuditCoordinator()
+        existing = mock.Mock()
+        existing.exists = True
+        existing.to_dict.return_value = {"status": "sent"}
+        monitor_ref = mock.Mock()
+        monitor_ref.get.return_value = existing
+        database = mock.Mock()
+        database.collection.return_value.document.return_value = monitor_ref
+        coordinator._db = database
+        report = build_daily_monitor_report(
+            jobs=[],
+            window_start=self.window_start,
+            window_end=self.window_end,
+            checks=self.healthy_checks,
+            issues=[],
+        )
+        with mock.patch.object(
+            coordinator, "collect_daily_monitor_report", return_value=report
+        ), mock.patch(
+            "vision_aid.site_audit.jobs.send_daily_monitor_email"
+        ) as send_email:
+            result = coordinator.run_daily_monitor(
+                schedule_time="2026-08-30T10:00:00Z"
+            )
+        self.assertTrue(result["duplicate"])
+        send_email.assert_not_called()
 
 
 class ReportTests(unittest.TestCase):

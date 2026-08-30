@@ -26,6 +26,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from google.protobuf import duration_pb2
 
 from .crawler import discover_site_urls, fetch_public_html, validate_public_url
+from .monitor import EASTERN, build_daily_monitor_report
 from .report import build_site_report
 from .url_list import safe_upload_name, validate_uploaded_urls
 
@@ -246,6 +247,58 @@ def send_report_email(
     }
 
 
+def send_daily_monitor_email(*, recipient: str, report: dict) -> dict:
+    """Submit the daily DAT usage and health report to SMTP."""
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER", "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "")
+    smtp_from = os.getenv("SMTP_FROM", smtp_user).strip()
+    self_delivery_fallback = os.getenv(
+        "DAT_SMTP_SELF_DELIVERY_FALLBACK", ""
+    ).strip()
+    if not all((smtp_host, smtp_user, smtp_password, smtp_from)):
+        raise RuntimeError("SMTP delivery is not configured")
+
+    message = EmailMessage()
+    message["Subject"] = str(report["subject"])
+    message["From"] = smtp_from
+    message["To"] = recipient
+    message["Date"] = format_datetime(_now())
+    message_id = make_msgid(domain=(smtp_from.rsplit("@", 1)[-1] or None))
+    message["Message-ID"] = message_id
+    message.set_content(str(report["text"]))
+    envelope_recipients = [recipient]
+    self_delivery_fallback_used = (
+        bool(self_delivery_fallback)
+        and recipient.strip().casefold() == smtp_from.casefold()
+        and self_delivery_fallback.casefold() != recipient.strip().casefold()
+    )
+    if self_delivery_fallback_used:
+        message["Cc"] = self_delivery_fallback
+        envelope_recipients.append(self_delivery_fallback)
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.ehlo()
+        smtp.login(smtp_user, smtp_password)
+        refused = smtp.send_message(
+            message,
+            from_addr=smtp_from,
+            to_addrs=envelope_recipients,
+        )
+    if refused:
+        refused_recipients = ", ".join(str(item) for item in refused)
+        raise RuntimeError(f"Mail server refused: {refused_recipients}")
+    return {
+        "message_id": message_id,
+        "accepted_at": _now(),
+        "self_delivery_fallback_used": self_delivery_fallback_used,
+        "accepted_recipient_count": len(envelope_recipients),
+    }
+
+
 class SiteAuditCoordinator:
     """Create, process, finalize, and serve asynchronous site-audit jobs."""
 
@@ -267,6 +320,12 @@ class SiteAuditCoordinator:
             if item.strip()
         }
         self.collection = os.getenv("DAT_JOB_COLLECTION", "dat_site_audit_jobs")
+        self.monitor_collection = os.getenv(
+            "DAT_MONITOR_COLLECTION", "dat_site_audit_monitor_runs"
+        )
+        self.monitor_email = os.getenv(
+            "DAT_DAILY_MONITOR_EMAIL", "abilitybazaar@visionaid.org"
+        ).strip().lower()
         self._db = None
         self._storage = None
         self._dispatcher = None
@@ -383,6 +442,9 @@ class SiteAuditCoordinator:
     def _job_ref(self, job_id: str):
         return self.db.collection(self.collection).document(job_id)
 
+    def _monitor_ref(self, report_date: str):
+        return self.db.collection(self.monitor_collection).document(report_date)
+
     def internal_token_valid(self, supplied: str) -> bool:
         return bool(self.job_token and hmac.compare_digest(self.job_token, supplied or ""))
 
@@ -461,6 +523,13 @@ class SiteAuditCoordinator:
             "created_at": _now(),
             "updated_at": _now(),
             "expires_at": _now() + timedelta(days=30),
+            "site_hosts": sorted(
+                {
+                    urlparse(item).hostname.lower()
+                    for item in (normalized_uploaded_urls or [normalized_url])
+                    if urlparse(item).hostname
+                }
+            ),
         }
         if normalized_mode == "url_list":
             job["provided_urls"] = normalized_uploaded_urls
@@ -919,6 +988,235 @@ class SiteAuditCoordinator:
             }
         )
         return self.public_job(self.get_job(job_id))
+
+    @staticmethod
+    def _parse_monitor_time(schedule_time: str) -> datetime:
+        value = str(schedule_time or "").strip()
+        if not value:
+            return _now()
+        if value.endswith("Z"):
+            value = f"{value[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("Invalid scheduler time") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def collect_daily_monitor_report(self, *, window_end: datetime) -> dict:
+        """Collect the previous 24 hours of usage and run operational checks."""
+        window_end = window_end.astimezone(timezone.utc)
+        window_start = window_end - timedelta(hours=24)
+        checks = {
+            "service_endpoint": False,
+            "core_configuration": self.configured,
+            "firestore": False,
+            "report_storage": False,
+            "saved_model_key": False,
+            "email_configuration": all(
+                os.getenv(name, "").strip()
+                for name in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM")
+            )
+            and bool(self.monitor_email),
+        }
+        issues: list[str] = []
+        jobs: list[dict] = []
+
+        if not checks["core_configuration"]:
+            issues.append("One or more required background-audit settings are missing.")
+        if not checks["email_configuration"]:
+            issues.append("The daily report email configuration is incomplete.")
+
+        try:
+            request = urllib.request.Request(
+                f"{self.service_url}/api/health",
+                headers={"User-Agent": "Vision-Aid-DAT-Daily-Monitor/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=15) as response:
+                health = json.loads(response.read().decode("utf-8"))
+            checks["service_endpoint"] = (
+                health.get("status") == "ok"
+                and health.get("service") == "vision-aid-dat"
+            )
+        except Exception as exc:
+            issues.append(f"The service health endpoint check failed ({type(exc).__name__}).")
+        if not checks["service_endpoint"] and not any(
+            item.startswith("The service health endpoint") for item in issues
+        ):
+            issues.append("The service health endpoint returned an unhealthy response.")
+
+        try:
+            snapshots = (
+                self.db.collection(self.collection)
+                .where(filter=FieldFilter("updated_at", ">=", window_start))
+                .stream()
+            )
+            jobs = [snapshot.to_dict() for snapshot in snapshots]
+            checks["firestore"] = True
+        except Exception as exc:
+            issues.append(f"The audit job database check failed ({type(exc).__name__}).")
+
+        try:
+            checks["report_storage"] = bool(self.bucket.exists())
+        except Exception as exc:
+            issues.append(f"The report storage check failed ({type(exc).__name__}).")
+        if not checks["report_storage"] and not any(
+            item.startswith("The report storage check") for item in issues
+        ):
+            issues.append("The configured report storage bucket was not found.")
+
+        try:
+            key_valid, key_message = self._verify_saved_key(self.model, refresh=True)
+            checks["saved_model_key"] = key_valid
+            if not key_valid:
+                issues.append(f"The saved AI model credential is not ready: {key_message}.")
+        except Exception as exc:
+            issues.append(f"The saved AI model credential check failed ({type(exc).__name__}).")
+
+        if checks["firestore"]:
+            try:
+                active_snapshots = (
+                    self.db.collection(self.collection)
+                    .where(filter=FieldFilter("status", "in", sorted(ACTIVE_STATUSES)))
+                    .stream()
+                )
+                stale_cutoff = window_end - timedelta(hours=6)
+                stale_jobs = []
+                for snapshot in active_snapshots:
+                    active_job = snapshot.to_dict()
+                    updated_at = active_job.get("updated_at") or active_job.get("created_at")
+                    if isinstance(updated_at, datetime):
+                        if updated_at.tzinfo is None:
+                            updated_at = updated_at.replace(tzinfo=timezone.utc)
+                        if updated_at.astimezone(timezone.utc) < stale_cutoff:
+                            stale_jobs.append(active_job)
+                if stale_jobs:
+                    issues.append(
+                        f"{len(stale_jobs)} audit job(s) have made no progress for more than 6 hours."
+                    )
+            except Exception as exc:
+                issues.append(f"The stale-job check failed ({type(exc).__name__}).")
+
+            page_failures = sum(max(0, int(job.get("pages_failed") or 0)) for job in jobs)
+            if page_failures:
+                issues.append(
+                    f"{page_failures} page(s) failed during audits requested in this reporting period."
+                )
+            enqueue_failures = sum(job.get("status") == "enqueue_failed" for job in jobs)
+            if enqueue_failures:
+                issues.append(
+                    f"{enqueue_failures} audit request(s) could not be added to the processing queue."
+                )
+            email_failures = sum(
+                1
+                for job in jobs
+                if str(job.get("last_error") or "").startswith("Email delivery failed")
+                or (job.get("status") == "complete" and not job.get("email_sent"))
+            )
+            if email_failures:
+                issues.append(
+                    f"{email_failures} completed or finalizing audit(s) have an email delivery issue."
+                )
+
+        return build_daily_monitor_report(
+            jobs=jobs,
+            window_start=window_start,
+            window_end=window_end,
+            checks=checks,
+            issues=issues,
+        )
+
+    def run_daily_monitor(
+        self,
+        *,
+        schedule_time: str = "",
+        send_email: bool = True,
+        force: bool = False,
+    ) -> dict:
+        """Run, optionally email, and deduplicate one daily monitor report."""
+        window_end = self._parse_monitor_time(schedule_time)
+        report_date = window_end.astimezone(EASTERN).strftime("%Y-%m-%d")
+        report = self.collect_daily_monitor_report(window_end=window_end)
+
+        if send_email and report["checks"].get("firestore") and not force:
+            existing = self._monitor_ref(report_date).get()
+            if existing.exists and existing.to_dict().get("status") == "sent":
+                return {
+                    "report_date": report_date,
+                    "health_status": report["health_status"],
+                    "audit_count": report["audit_count"],
+                    "pages_processed": report["pages_processed"],
+                    "estimated_cost_usd": report["estimated_cost_usd"],
+                    "email_sent": True,
+                    "duplicate": True,
+                }
+
+        monitor_ref = self._monitor_ref(report_date) if report["checks"].get("firestore") else None
+        if send_email and monitor_ref:
+            monitor_ref.set(
+                {
+                    "report_date": report_date,
+                    "status": "sending",
+                    "window_start": report["window_start"],
+                    "window_end": report["window_end"],
+                    "health_status": report["health_status"],
+                    "audit_count": report["audit_count"],
+                    "pages_processed": report["pages_processed"],
+                    "estimated_cost_usd": report["estimated_cost_usd"],
+                    "updated_at": _now(),
+                },
+                merge=True,
+            )
+
+        receipt = None
+        if send_email:
+            try:
+                receipt = send_daily_monitor_email(
+                    recipient=self.monitor_email,
+                    report=report,
+                )
+            except Exception as exc:
+                if monitor_ref:
+                    monitor_ref.set(
+                        {
+                            "status": "failed",
+                            "last_error": f"Email delivery failed ({type(exc).__name__})",
+                            "updated_at": _now(),
+                        },
+                        merge=True,
+                    )
+                raise
+            if monitor_ref:
+                monitor_ref.set(
+                    {
+                        "status": "sent",
+                        "email_accepted_at": receipt["accepted_at"],
+                        "email_message_id": receipt["message_id"],
+                        "email_self_delivery_fallback_used": receipt[
+                            "self_delivery_fallback_used"
+                        ],
+                        "email_accepted_recipient_count": receipt[
+                            "accepted_recipient_count"
+                        ],
+                        "updated_at": _now(),
+                        "last_error": firestore.DELETE_FIELD,
+                    },
+                    merge=True,
+                )
+
+        return {
+            "report_date": report_date,
+            "health_status": report["health_status"],
+            "health_label": report["health_label"],
+            "issues": report["issues"],
+            "audit_count": report["audit_count"],
+            "pages_processed": report["pages_processed"],
+            "pages_failed": report["pages_failed"],
+            "estimated_cost_usd": report["estimated_cost_usd"],
+            "email_sent": bool(receipt),
+            "duplicate": False,
+        }
 
     def report_bytes(self, job_id: str) -> bytes | None:
         job = self.get_job(job_id)

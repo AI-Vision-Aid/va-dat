@@ -289,7 +289,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._handle_login()
         elif self.path.startswith("/api/internal/site-audits/"):
             operation = self.path.rsplit("/", 1)[-1]
-            if operation not in {"discover", "page", "finalize"}:
+            if operation not in {"discover", "page", "finalize", "daily-monitor"}:
                 self.send_error(404, "Not Found")
                 return
             self._handle_internal_site_audit(operation)
@@ -776,10 +776,20 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
         try:
             data = self._read_json_body()
-            job_id = data.get("job_id", "")
-            if operation == "discover":
+            if operation == "daily-monitor":
+                result = coordinator.run_daily_monitor(
+                    schedule_time=(
+                        self.headers.get("X-CloudScheduler-ScheduleTime", "")
+                        or str(data.get("schedule_time") or "")
+                    ),
+                    send_email=bool(data.get("send_email", True)),
+                    force=bool(data.get("force", False)),
+                )
+            elif operation == "discover":
+                job_id = data.get("job_id", "")
                 result = coordinator.run_discovery(job_id)
             elif operation == "page":
+                job_id = data.get("job_id", "")
                 retry_count = int(self.headers.get("X-CloudTasks-TaskRetryCount", "0"))
                 result = coordinator.run_page(
                     job_id=job_id,
@@ -788,6 +798,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                     audit_callable=run_audit,
                 )
             else:
+                job_id = data.get("job_id", "")
                 result = coordinator.finalize(job_id)
         except ValueError as exc:
             self._send_json({"success": False, "error": str(exc)}, 400)

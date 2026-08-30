@@ -324,10 +324,6 @@
                   <span>URL &#8212; Single Page</span>
                 </label>
                 <label class="audit-mode-tab">
-                  <input type="radio" name="auditMode" value="url-nested" />
-                  <span>URL &#8212; With Crawl</span>
-                </label>
-                <label class="audit-mode-tab">
                   <input type="radio" name="auditMode" value="site" checked />
                   <span>Full Site &#8212; Crawl and Email</span>
                 </label>
@@ -460,8 +456,6 @@
                 />
                 <p class="field-hint" id="urlInputHint">
                   The server fetches and audits this page.
-                  <em>URL &#8212; With Crawl</em> also follows in-domain links
-                  up to one level deep (max&nbsp;10 links per page).
                 </p>
                 <p
                   class="form-error"
@@ -909,7 +903,7 @@
         const isUrlList = mode === "url-list";
         const isBulk = isFullSite || isUrlList;
         htmlInputSection.hidden = !isHtml;
-        urlInputSection.hidden = !(mode === "url" || mode === "url-nested" || isFullSite);
+        urlInputSection.hidden = !(mode === "url" || isFullSite);
         urlListInputSection.hidden = !isUrlList;
         siteEmailSection.hidden = !isBulk;
         modelKeySection.hidden = false;
@@ -926,7 +920,7 @@
           submitButtonLabel(mode);
         urlInputHint.innerHTML = isFullSite
           ? "The crawler uses sitemaps, internal links, and GPT-5.6 Sol to identify and audit up to 200 public pages."
-          : "The server fetches and audits this page. <em>URL — With Crawl</em> also follows in-domain links up to one level deep (max&nbsp;10 links per page).";
+          : "The server fetches and audits this page.";
       }
 
       document.querySelectorAll('input[name="auditMode"]').forEach((radio) => {
@@ -1191,10 +1185,7 @@
                     };
                     if (keyValue) requestBody.api_key = keyValue;
                   } else {
-                    endpoint =
-                            mode === "url-nested"
-                                    ? "/api/audit/url/nested"
-                                    : "/api/audit/url";
+                    endpoint = "/api/audit/url";
                     requestBody = { url: urlVal, [keyField]: keyValue, model };
                   }
                 }
@@ -1211,13 +1202,12 @@
                 content.innerHTML = "";
 
                 // Show progress bar for all audit modes
-                const isNested = mode === "url-nested";
                 const isAsyncBulk = mode === "site" || mode === "url-list";
                 const initialMsg = mode === "url-list"
                   ? "Uploading URL list and queueing batch audit\u2026"
                   : isAsyncBulk
                   ? "Queueing full-site audit\u2026"
-                  : (isNested ? "Crawling pages\u2026" : "Starting audit\u2026");
+                  : "Starting audit\u2026";
                 const initialDetail = mode === "url-list"
                   ? "Validating the uploaded URLs..."
                   : "Analyzing site structure...";
