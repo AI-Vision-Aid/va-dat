@@ -114,9 +114,9 @@ Cloud Scheduler should call the endpoint at 6:00 a.m. in the
 to the service as `DAT_JOB_TOKEN`; never place the token in source control.
 
 ```powershell
-$datJobToken = gcloud secrets versions access latest `
+$datJobToken = (gcloud secrets versions access latest `
   --secret ability-bazaar-dat-job-token `
-  --project ability-bazaar-2026
+  --project ability-bazaar-2026 | Out-String).Trim()
 
 gcloud scheduler jobs create http ability-bazaar-dat-daily-monitor `
   --project ability-bazaar-2026 `

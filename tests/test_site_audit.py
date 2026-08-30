@@ -608,6 +608,50 @@ class DailyMonitorTests(unittest.TestCase):
         self.assertEqual(error["health_status"], "error")
         self.assertIn("NOT WORKING", error["text"])
 
+    def test_live_checks_use_object_access_instead_of_bucket_metadata(self):
+        coordinator = SiteAuditCoordinator()
+        coordinator.project = "test-project"
+        coordinator.service_url = "https://dat.example.com"
+        coordinator.bucket_name = "test-bucket"
+        coordinator.job_token = "job-token"
+        coordinator.api_key = "saved-key"
+        coordinator.credential_encryption_key = Fernet.generate_key().decode("ascii")
+        database = mock.Mock()
+        database.collection.return_value.where.return_value.stream.return_value = []
+        coordinator._db = database
+        bucket = mock.Mock()
+        bucket.list_blobs.return_value = []
+        coordinator._storage = mock.Mock()
+        coordinator._storage.bucket.return_value = bucket
+        health_response = mock.Mock()
+        health_response.read.return_value = json.dumps(
+            {"status": "ok", "service": "vision-aid-dat"}
+        ).encode("utf-8")
+        health_context = mock.Mock()
+        health_context.__enter__ = mock.Mock(return_value=health_response)
+        health_context.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SMTP_HOST": "smtp.example.com",
+                "SMTP_USER": "sender@example.com",
+                "SMTP_PASSWORD": "secret",
+                "SMTP_FROM": "sender@example.com",
+            },
+        ), mock.patch(
+            "vision_aid.site_audit.jobs.urllib.request.urlopen",
+            return_value=health_context,
+        ), mock.patch.object(
+            coordinator, "_verify_saved_key", return_value=(True, "Verified")
+        ):
+            report = coordinator.collect_daily_monitor_report(
+                window_end=self.window_end
+            )
+        self.assertTrue(report["checks"]["report_storage"])
+        self.assertEqual(report["health_status"], "ok")
+        bucket.list_blobs.assert_called_once_with(max_results=1)
+        self.assertFalse(bucket.exists.called)
+
     def test_sent_report_is_not_emailed_twice_for_same_eastern_date(self):
         coordinator = SiteAuditCoordinator()
         existing = mock.Mock()

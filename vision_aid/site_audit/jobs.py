@@ -1058,7 +1058,11 @@ class SiteAuditCoordinator:
             issues.append(f"The audit job database check failed ({type(exc).__name__}).")
 
         try:
-            checks["report_storage"] = bool(self.bucket.exists())
+            # The runtime intentionally has object access without bucket-metadata
+            # administration. Listing at most one object verifies the permission
+            # the audit actually needs without producing a health-check object.
+            next(iter(self.bucket.list_blobs(max_results=1)), None)
+            checks["report_storage"] = True
         except Exception as exc:
             issues.append(f"The report storage check failed ({type(exc).__name__}).")
         if not checks["report_storage"] and not any(
