@@ -161,6 +161,9 @@ def send_report_email(
     smtp_user = os.getenv("SMTP_USER", "").strip()
     smtp_password = os.getenv("SMTP_PASSWORD", "")
     smtp_from = os.getenv("SMTP_FROM", smtp_user).strip()
+    self_delivery_fallback = os.getenv(
+        "DAT_SMTP_SELF_DELIVERY_FALLBACK", ""
+    ).strip()
     if not all((smtp_host, smtp_user, smtp_password, smtp_from)):
         raise RuntimeError("SMTP delivery is not configured")
 
@@ -172,6 +175,15 @@ def send_report_email(
     message["Date"] = format_datetime(_now())
     message_id = make_msgid(domain=(smtp_from.rsplit("@", 1)[-1] or None))
     message["Message-ID"] = message_id
+    envelope_recipients = [recipient]
+    self_delivery_fallback_used = (
+        bool(self_delivery_fallback)
+        and recipient.strip().casefold() == smtp_from.casefold()
+        and self_delivery_fallback.casefold() != recipient.strip().casefold()
+    )
+    if self_delivery_fallback_used:
+        message["Cc"] = self_delivery_fallback
+        envelope_recipients.append(self_delivery_fallback)
     attach_report = os.getenv("DAT_EMAIL_ATTACH_REPORT", "").strip().lower() in {
         "1",
         "true",
@@ -201,7 +213,7 @@ def send_report_email(
         refused = smtp.send_message(
             message,
             from_addr=smtp_from,
-            to_addrs=[recipient],
+            to_addrs=envelope_recipients,
         )
     if refused:
         refused_recipients = ", ".join(str(item) for item in refused)
@@ -213,6 +225,8 @@ def send_report_email(
         "recipient": recipient,
         "smtp_host": smtp_host,
         "attachment_included": attach_report and len(report_zip) <= 18 * 1024 * 1024,
+        "self_delivery_fallback_used": self_delivery_fallback_used,
+        "accepted_recipient_count": len(envelope_recipients),
     }
 
 
@@ -795,6 +809,12 @@ class SiteAuditCoordinator:
                 "email_message_id": delivery["message_id"],
                 "email_accepted_at": delivery["accepted_at"],
                 "email_attachment_included": delivery["attachment_included"],
+                "email_self_delivery_fallback_used": delivery[
+                    "self_delivery_fallback_used"
+                ],
+                "email_accepted_recipient_count": delivery[
+                    "accepted_recipient_count"
+                ],
                 "completed_at": _now(),
                 "updated_at": _now(),
                 "last_error": firestore.DELETE_FIELD,
@@ -826,6 +846,12 @@ class SiteAuditCoordinator:
                 "email_message_id": delivery["message_id"],
                 "email_accepted_at": delivery["accepted_at"],
                 "email_attachment_included": delivery["attachment_included"],
+                "email_self_delivery_fallback_used": delivery[
+                    "self_delivery_fallback_used"
+                ],
+                "email_accepted_recipient_count": delivery[
+                    "accepted_recipient_count"
+                ],
                 "email_resend_count": firestore.Increment(1),
                 "updated_at": _now(),
                 "last_error": firestore.DELETE_FIELD,

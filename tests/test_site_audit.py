@@ -211,6 +211,7 @@ class EmailTests(unittest.TestCase):
                 "SMTP_PASSWORD": "secret",
                 "SMTP_FROM": "sender@example.com",
                 "DAT_EMAIL_ATTACH_REPORT": "false",
+                "DAT_SMTP_SELF_DELIVERY_FALLBACK": "",
             },
         ), mock.patch(
             "vision_aid.site_audit.jobs.smtplib.SMTP", return_value=smtp_context
@@ -228,6 +229,50 @@ class EmailTests(unittest.TestCase):
         self.assertEqual(receipt["recipient"], "recipient@example.com")
         self.assertFalse(receipt["attachment_included"])
         self.assertTrue(receipt["message_id"].startswith("<"))
+        self.assertFalse(receipt["self_delivery_fallback_used"])
+        self.assertEqual(receipt["accepted_recipient_count"], 1)
+        self.assertEqual(
+            smtp.send_message.call_args.kwargs["to_addrs"],
+            ["recipient@example.com"],
+        )
+
+    def test_self_delivery_adds_visible_fallback_copy(self):
+        smtp = mock.Mock()
+        smtp.send_message.return_value = {}
+        smtp_context = mock.Mock()
+        smtp_context.__enter__ = mock.Mock(return_value=smtp)
+        smtp_context.__exit__ = mock.Mock(return_value=False)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SMTP_HOST": "smtp.office365.com",
+                "SMTP_PORT": "587",
+                "SMTP_USER": "abilitybazaar@visionaid.org",
+                "SMTP_PASSWORD": "secret",
+                "SMTP_FROM": "abilitybazaar@visionaid.org",
+                "DAT_EMAIL_ATTACH_REPORT": "false",
+                "DAT_SMTP_SELF_DELIVERY_FALLBACK": "ram@visionaid.org",
+            },
+        ), mock.patch(
+            "vision_aid.site_audit.jobs.smtplib.SMTP", return_value=smtp_context
+        ):
+            receipt = send_report_email(
+                recipient="abilitybazaar@visionaid.org",
+                base_url="https://dat.visionaid.org/",
+                pages=26,
+                findings=290,
+                download_url="https://dat.example.com/report",
+                report_zip=b"zip",
+            )
+        message = smtp.send_message.call_args.args[0]
+        self.assertEqual(message["To"], "abilitybazaar@visionaid.org")
+        self.assertEqual(message["Cc"], "ram@visionaid.org")
+        self.assertEqual(
+            smtp.send_message.call_args.kwargs["to_addrs"],
+            ["abilitybazaar@visionaid.org", "ram@visionaid.org"],
+        )
+        self.assertTrue(receipt["self_delivery_fallback_used"])
+        self.assertEqual(receipt["accepted_recipient_count"], 2)
 
     def test_email_raises_when_recipient_is_refused(self):
         smtp = mock.Mock()
@@ -242,6 +287,7 @@ class EmailTests(unittest.TestCase):
                 "SMTP_USER": "sender@example.com",
                 "SMTP_PASSWORD": "secret",
                 "SMTP_FROM": "sender@example.com",
+                "DAT_SMTP_SELF_DELIVERY_FALLBACK": "",
             },
         ), mock.patch(
             "vision_aid.site_audit.jobs.smtplib.SMTP", return_value=smtp_context
