@@ -30,7 +30,11 @@ from vision_aid.site_audit.jobs import (
     send_report_email,
     validate_request_email,
 )
-from vision_aid.site_audit.monitor import build_daily_monitor_report
+from entry_points.api_server import AuditHandler, _resolve_api_key
+from vision_aid.site_audit.monitor import (
+    build_daily_monitor_html,
+    build_daily_monitor_report,
+)
 from vision_aid.site_audit.report import build_site_report
 from vision_aid.site_audit.url_list import (
     decode_uploaded_urls,
@@ -45,8 +49,18 @@ class AuditModeUiTests(unittest.TestCase):
         )
         self.assertNotIn('value="url-nested"', html)
         self.assertNotIn("URL &#8212; With Crawl", html)
-        self.assertIn('value="site" checked', html)
+        self.assertIn('value="url" checked', html)
+        self.assertIn('class="audit-mode-tab admin-mode-tab" hidden', html)
         self.assertIn("Full Site &#8212; Crawl and Email", html)
+        self.assertIn('href="/analytics">Analytics</a>', html)
+
+    def test_analytics_page_links_to_both_protected_bulk_tools(self):
+        html = (Path(__file__).resolve().parents[1] / "analytics.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('href="/analytics/full-site"', html)
+        self.assertIn('href="/analytics/url-list"', html)
+        self.assertIn("Reports are retained here for 30 days", html)
 
 
 class CrawlerSafetyTests(unittest.TestCase):
@@ -412,6 +426,25 @@ class EmailTests(unittest.TestCase):
         self.assertEqual(receipt["accepted_recipient_count"], 2)
 
 
+class AccessControlTests(unittest.TestCase):
+    def test_admin_cookie_is_required_and_compared(self):
+        handler = object.__new__(AuditHandler)
+        with mock.patch.dict(os.environ, {"DAT_SITE_PASSWORD": "test-password"}):
+            handler.headers = {"Cookie": ""}
+            self.assertFalse(handler._admin_access_allowed())
+            token = handler._admin_cookie()
+            handler.headers = {"Cookie": f"other=x; dat_admin={token}"}
+            self.assertTrue(handler._admin_access_allowed())
+            handler.headers = {"Cookie": "dat_admin=wrong"}
+            self.assertFalse(handler._admin_access_allowed())
+
+    def test_missing_admin_password_does_not_unlock_admin_routes(self):
+        handler = object.__new__(AuditHandler)
+        handler.headers = {"Cookie": ""}
+        with mock.patch.dict(os.environ, {"DAT_SITE_PASSWORD": ""}):
+            self.assertFalse(handler._admin_access_allowed())
+
+
 class CredentialTests(unittest.TestCase):
     def test_override_is_encrypted_and_decrypted_only_for_the_job(self):
         encryption_key = Fernet.generate_key().decode("ascii")
@@ -435,7 +468,7 @@ class CredentialTests(unittest.TestCase):
             "override-test-credential",
         )
 
-    def test_public_config_masks_and_never_returns_saved_key(self):
+    def test_public_config_hides_saved_key_and_admin_config_only_masks_it(self):
         encryption_key = Fernet.generate_key().decode("ascii")
         with mock.patch.dict(
             os.environ,
@@ -450,10 +483,39 @@ class CredentialTests(unittest.TestCase):
             "vision_aid.site_audit.jobs.verify_model_key",
             return_value=(True, "Verified"),
         ):
-            config = coordinator.public_config(refresh=True)
-        self.assertTrue(config["api_key_verified"])
-        self.assertEqual(config["api_key_masked"], "••••••••••••••••")
-        self.assertNotIn("saved-test-credential", repr(config))
+            public_config = coordinator.public_config(refresh=True)
+            admin_config = coordinator.public_config(
+                refresh=True, allow_saved_key=True
+            )
+        self.assertFalse(public_config["admin_authenticated"])
+        self.assertFalse(public_config["api_key_configured"])
+        self.assertFalse(public_config["api_key_verified"])
+        self.assertEqual(public_config["api_key_masked"], "")
+        self.assertTrue(admin_config["admin_authenticated"])
+        self.assertTrue(admin_config["api_key_verified"])
+        self.assertEqual(admin_config["api_key_masked"], "••••••••••••••••")
+        self.assertNotIn("saved-test-credential", repr(admin_config))
+
+    def test_public_key_resolution_never_uses_process_credentials(self):
+        with mock.patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "must-not-be-used"},
+            clear=False,
+        ):
+            self.assertEqual(_resolve_api_key({}, "gpt-5.6-sol"), "")
+        self.assertEqual(
+            _resolve_api_key(
+                {}, "gpt-5.6-sol", saved_openai_api_key="admin-only-key"
+            ),
+            "admin-only-key",
+        )
+
+    def test_saved_key_validation_requires_admin_authorization(self):
+        coordinator = SiteAuditCoordinator()
+        with self.assertRaisesRegex(ValueError, "Admin sign-in"):
+            coordinator.verify_requested_key(
+                model="gpt-5.6-sol", use_saved=True
+            )
 
 
 class JobCreationTests(unittest.TestCase):
@@ -495,6 +557,7 @@ class JobCreationTests(unittest.TestCase):
                 audit_mode="url_list",
                 uploaded_urls=uploaded,
                 source_file_name="pages.txt",
+                allow_saved_key=True,
             )
         stored = job_ref.set.call_args.args[0]
         self.assertEqual(public["audit_mode"], "url_list")
@@ -506,6 +569,25 @@ class JobCreationTests(unittest.TestCase):
             coordinator._dispatcher.enqueue.call_args.args[0],
             "/api/internal/site-audits/discover",
         )
+
+    def test_bulk_job_cannot_use_saved_key_without_admin_authorization(self):
+        coordinator = SiteAuditCoordinator()
+        coordinator.project = "test-project"
+        coordinator.service_url = "https://dat.example.com"
+        coordinator.bucket_name = "test-bucket"
+        coordinator.job_token = "test-job-token"
+        coordinator.api_key = "saved-test-credential"
+        coordinator.credential_encryption_key = Fernet.generate_key().decode("ascii")
+        with mock.patch(
+            "vision_aid.site_audit.jobs.validate_public_url",
+            return_value="https://example.com/",
+        ):
+            with self.assertRaisesRegex(ValueError, "administrator"):
+                coordinator.create_job(
+                    base_url="https://example.com/",
+                    email="tester@example.com",
+                    model="gpt-5.6-sol",
+                )
 
 
 class ProgressTests(unittest.TestCase):
@@ -659,6 +741,116 @@ class DailyMonitorTests(unittest.TestCase):
         self.assertIn("Uploaded HTML (site not supplied)", report["text"])
         self.assertIn("Mode: Uploaded HTML", report["text"])
 
+    def test_daily_web_report_escapes_untrusted_site_values(self):
+        report = build_daily_monitor_report(
+            jobs=[
+                {
+                    "base_url": "https://example.com/<script>alert(1)</script>",
+                    "audit_mode": "crawl",
+                    "status": "complete",
+                    "model": "<script>alert(1)</script>",
+                    "pages_total": 1,
+                    "pages_completed": 1,
+                    "created_at": self.window_start + timedelta(hours=1),
+                }
+            ],
+            window_start=self.window_start,
+            window_end=self.window_end,
+            checks=self.healthy_checks,
+            issues=[],
+        )
+        html = build_daily_monitor_html(report).decode("utf-8")
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+        self.assertIn('href="/analytics"', html)
+
+    def test_analytics_summary_is_aggregate_only(self):
+        coordinator = SiteAuditCoordinator()
+        job_collection = mock.Mock()
+        usage_collection = mock.Mock()
+
+        def snapshot(value):
+            item = mock.Mock()
+            item.to_dict.return_value = value
+            return item
+
+        job_collection.stream.return_value = [
+            snapshot(
+                {
+                    "email": "private@example.com",
+                    "email_hash": "hash-1",
+                    "site_hosts": ["example.com"],
+                    "report_ready": True,
+                    "pages_completed": 3,
+                    "total_input_tokens": 100,
+                    "total_output_tokens": 20,
+                    "estimated_cost_usd": 0.1,
+                }
+            ),
+            snapshot(
+                {
+                    "email_hash": "hash-1",
+                    "site_hosts": ["example.org"],
+                    "report_ready": False,
+                    "pages_completed": 1,
+                }
+            ),
+        ]
+        usage_collection.stream.return_value = [
+            snapshot(
+                {
+                    "status": "complete",
+                    "site_hosts": ["example.com"],
+                    "pages_completed": 1,
+                    "total_input_tokens": 10,
+                    "total_output_tokens": 5,
+                    "estimated_cost_usd": 0.02,
+                }
+            )
+        ]
+        database = mock.Mock()
+        database.collection.side_effect = lambda name: (
+            job_collection if name == coordinator.collection else usage_collection
+        )
+        coordinator._db = database
+        summary = coordinator.analytics_summary()
+        self.assertEqual(summary["users"], 1)
+        self.assertEqual(summary["reports"], 2)
+        self.assertEqual(summary["sites"], 2)
+        self.assertEqual(summary["pages_scanned"], 5)
+        self.assertEqual(summary["total_tokens"], 135)
+        self.assertEqual(summary["estimated_cost_usd"], 0.12)
+        self.assertNotIn("private@example.com", repr(summary))
+
+    def test_daily_report_retention_removes_records_beyond_thirty(self):
+        coordinator = SiteAuditCoordinator()
+        snapshots = []
+        for index in range(32):
+            item = mock.Mock()
+            item.to_dict.return_value = {
+                "report_object": f"monitor/daily/2026-08-{32 - index:02d}.html"
+            }
+            item.reference = mock.Mock()
+            snapshots.append(item)
+        query = mock.Mock()
+        query.stream.return_value = snapshots
+        collection = mock.Mock()
+        collection.order_by.return_value = query
+        database = mock.Mock()
+        database.collection.return_value = collection
+        coordinator._db = database
+        bucket = mock.Mock()
+        coordinator._storage = mock.Mock()
+        coordinator._storage.bucket.return_value = bucket
+
+        coordinator._prune_daily_monitor_reports()
+
+        for item in snapshots[:30]:
+            item.reference.delete.assert_not_called()
+        for item in snapshots[30:]:
+            item.reference.delete.assert_called_once_with()
+        self.assertEqual(bucket.blob.return_value.delete.call_count, 2)
+
     def test_live_checks_use_object_access_instead_of_bucket_metadata(self):
         coordinator = SiteAuditCoordinator()
         coordinator.project = "test-project"
@@ -707,7 +899,10 @@ class DailyMonitorTests(unittest.TestCase):
         coordinator = SiteAuditCoordinator()
         existing = mock.Mock()
         existing.exists = True
-        existing.to_dict.return_value = {"status": "sent"}
+        existing.to_dict.return_value = {
+            "status": "sent",
+            "report_object": "monitor/daily/2026-08-30.html",
+        }
         monitor_ref = mock.Mock()
         monitor_ref.get.return_value = existing
         database = mock.Mock()

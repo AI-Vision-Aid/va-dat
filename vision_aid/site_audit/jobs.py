@@ -26,7 +26,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from google.protobuf import duration_pb2
 
 from .crawler import discover_site_urls, fetch_public_html, validate_public_url
-from .monitor import EASTERN, build_daily_monitor_report
+from .monitor import EASTERN, build_daily_monitor_html, build_daily_monitor_report
 from .report import build_site_report
 from .url_list import safe_upload_name, validate_uploaded_urls
 
@@ -370,10 +370,20 @@ class SiteAuditCoordinator:
         self._key_verification_cache[selected_model] = (_now(), valid, message)
         return valid, message
 
-    def public_config(self, *, model: str | None = None, refresh: bool = False) -> dict:
-        """Return non-secret model and saved-key state for the signed-in UI."""
+    def public_config(
+        self,
+        *,
+        model: str | None = None,
+        refresh: bool = False,
+        allow_saved_key: bool = False,
+    ) -> dict:
+        """Return model state while exposing saved-key metadata only to admins."""
         selected_model = validate_model_name(model or self.model)
-        saved_available = bool(self.api_key and _model_provider(selected_model) == "openai")
+        saved_available = bool(
+            allow_saved_key
+            and self.api_key
+            and _model_provider(selected_model) == "openai"
+        )
         verified, message = (
             self._verify_saved_key(selected_model, refresh=refresh)
             if saved_available
@@ -387,6 +397,7 @@ class SiteAuditCoordinator:
             "api_key_masked": "••••••••••••••••" if saved_available else "",
             "api_key_verified": verified,
             "verification_message": message,
+            "admin_authenticated": bool(allow_saved_key),
         }
 
     def verify_requested_key(
@@ -396,9 +407,12 @@ class SiteAuditCoordinator:
         api_key: str = "",
         use_saved: bool = False,
         refresh: bool = False,
+        allow_saved_key: bool = False,
     ) -> tuple[bool, str]:
         selected_model = validate_model_name(model)
         if use_saved:
+            if not allow_saved_key:
+                raise ValueError("Admin sign-in is required to use the saved API key")
             return self._verify_saved_key(selected_model, refresh=refresh)
         return verify_model_key(api_key, selected_model)
 
@@ -517,6 +531,7 @@ class SiteAuditCoordinator:
         audit_mode: str = "crawl",
         uploaded_urls: list[str] | None = None,
         source_file_name: str = "",
+        allow_saved_key: bool = False,
     ) -> dict:
         """Persist and enqueue a new crawl or uploaded URL-list audit job."""
         if not self.configured:
@@ -542,6 +557,10 @@ class SiteAuditCoordinator:
             encrypted_override = self._encrypt_credential(override_key)
             credential_source = "override"
         else:
+            if not allow_saved_key:
+                raise ValueError(
+                    "Enter an API key or sign in as an administrator to use the saved key"
+                )
             if _model_provider(selected_model) != "openai":
                 raise ValueError("Enter an API key when selecting a non-OpenAI model")
             valid, message = self._verify_saved_key(selected_model)
@@ -1214,7 +1233,23 @@ class SiteAuditCoordinator:
 
         if send_email and report["checks"].get("firestore") and not force:
             existing = self._monitor_ref(report_date).get()
-            if existing.exists and existing.to_dict().get("status") == "sent":
+            existing_data = existing.to_dict() if existing.exists else {}
+            if existing_data.get("status") == "sent":
+                if not existing_data.get("report_object"):
+                    report_object = f"monitor/daily/{report_date}.html"
+                    self.bucket.blob(report_object).upload_from_string(
+                        build_daily_monitor_html(report),
+                        content_type="text/html; charset=utf-8",
+                    )
+                    self._monitor_ref(report_date).set(
+                        {
+                            "report_object": report_object,
+                            "report_saved_at": _now(),
+                            "updated_at": _now(),
+                        },
+                        merge=True,
+                    )
+                    self._prune_daily_monitor_reports()
                 return {
                     "report_date": report_date,
                     "health_status": report["health_status"],
@@ -1245,6 +1280,21 @@ class SiteAuditCoordinator:
         receipt = None
         if send_email:
             try:
+                report_object = f"monitor/daily/{report_date}.html"
+                self.bucket.blob(report_object).upload_from_string(
+                    build_daily_monitor_html(report),
+                    content_type="text/html; charset=utf-8",
+                )
+                if monitor_ref:
+                    monitor_ref.set(
+                        {
+                            "report_object": report_object,
+                            "report_saved_at": _now(),
+                            "updated_at": _now(),
+                        },
+                        merge=True,
+                    )
+                self._prune_daily_monitor_reports()
                 receipt = send_daily_monitor_email(
                     recipient=self.monitor_email,
                     report=report,
@@ -1290,6 +1340,120 @@ class SiteAuditCoordinator:
             "email_sent": bool(receipt),
             "duplicate": False,
         }
+
+    def _prune_daily_monitor_reports(self, *, keep: int = 30) -> None:
+        """Delete daily web-report records and objects beyond the retention limit."""
+        try:
+            snapshots = list(
+                self.db.collection(self.monitor_collection)
+                .order_by("window_end", direction=firestore.Query.DESCENDING)
+                .stream()
+            )
+            for snapshot in snapshots[max(1, int(keep)) :]:
+                item = snapshot.to_dict()
+                object_name = str(item.get("report_object") or "")
+                if object_name.startswith("monitor/daily/") and object_name.endswith(
+                    ".html"
+                ):
+                    self.bucket.blob(object_name).delete()
+                snapshot.reference.delete()
+        except Exception as exc:
+            # Retention cleanup must not block the daily health email. A later
+            # monitor run will retry the same bounded cleanup.
+            print(f"Daily monitor retention cleanup failed ({type(exc).__name__})")
+
+    def analytics_summary(self) -> dict:
+        """Return privacy-safe cumulative usage metrics for administrators."""
+        jobs = [
+            snapshot.to_dict()
+            for snapshot in self.db.collection(self.collection).stream()
+        ]
+        usage_events = [
+            snapshot.to_dict()
+            for snapshot in self.db.collection(self.usage_collection).stream()
+        ]
+        records = jobs + usage_events
+        users = {str(item.get("email_hash")) for item in jobs if item.get("email_hash")}
+        sites = {
+            str(host).lower()
+            for item in records
+            for host in (item.get("site_hosts") or [])
+            if host
+        }
+        completed_sync = sum(item.get("status") == "complete" for item in usage_events)
+        completed_reports = sum(bool(item.get("report_ready")) for item in jobs)
+        input_tokens = sum(
+            max(0, int(item.get("total_input_tokens") or 0)) for item in records
+        )
+        output_tokens = sum(
+            max(0, int(item.get("total_output_tokens") or 0)) for item in records
+        )
+        return {
+            "users": len(users),
+            "reports": completed_sync + completed_reports,
+            "sites": len(sites),
+            "pages_scanned": sum(
+                max(0, int(item.get("pages_completed") or 0)) for item in records
+            ),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "estimated_cost_usd": round(
+                sum(float(item.get("estimated_cost_usd") or 0) for item in records),
+                6,
+            ),
+            "history_note": (
+                "Users are distinct email requesters. Totals reflect records "
+                "currently retained by the service; anonymous public users are not identified."
+            ),
+        }
+
+    def list_daily_monitor_reports(self, *, limit: int = 30) -> list[dict]:
+        """Return recent saved monitor-report metadata for the admin dashboard."""
+        snapshots = (
+            self.db.collection(self.monitor_collection)
+            .order_by("window_end", direction=firestore.Query.DESCENDING)
+            .limit(max(1, min(int(limit), 100)))
+            .stream()
+        )
+        reports = []
+        for snapshot in snapshots:
+            item = snapshot.to_dict()
+            report_date = str(item.get("report_date") or snapshot.id)
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", report_date):
+                continue
+            reports.append(
+                {
+                    "report_date": report_date,
+                    "status": str(item.get("status") or "unknown"),
+                    "health_status": str(item.get("health_status") or "unknown"),
+                    "audit_count": max(0, int(item.get("audit_count") or 0)),
+                    "pages_processed": max(0, int(item.get("pages_processed") or 0)),
+                    "estimated_cost_usd": max(
+                        0.0, float(item.get("estimated_cost_usd") or 0)
+                    ),
+                    "report_available": bool(item.get("report_object")),
+                    "report_url": f"/analytics/reports/{report_date}"
+                    if item.get("report_object")
+                    else "",
+                }
+            )
+        return reports
+
+    def daily_monitor_report_bytes(self, report_date: str) -> bytes | None:
+        """Load one private daily web report by its bounded calendar date."""
+        normalized = str(report_date or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            raise ValueError("Invalid report date")
+        snapshot = self._monitor_ref(normalized).get()
+        if not snapshot.exists:
+            return None
+        object_name = str(snapshot.to_dict().get("report_object") or "")
+        if not object_name.startswith("monitor/daily/") or not object_name.endswith(
+            ".html"
+        ):
+            return None
+        return self.bucket.blob(object_name).download_as_bytes()
 
     def report_bytes(self, job_id: str) -> bytes | None:
         job = self.get_job(job_id)

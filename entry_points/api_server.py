@@ -11,11 +11,11 @@ Usage:
 
 Then open http://localhost:8000 in your browser.
 
-API keys can be supplied per-request in the POST body, or set in the .env
-file / environment.  Per-request keys take priority.
+Public API keys can be supplied per request. Saved server credentials are used
+only for requests carrying a valid administrator cookie.
 
-  Anthropic models → field ``api_key``        / env ``ANTHROPIC_API_KEY``
-  OpenAI models    → field ``openai_api_key`` / env ``OPENAI_API_KEY``
+  Anthropic models → field ``api_key``
+  OpenAI models    → field ``openai_api_key``
 """
 
 import json
@@ -73,28 +73,26 @@ STATIC_DIR = PROJECT_ROOT  # index.html and styles.css live at the repo root
 
 # ── Key resolution ────────────────────────────────────────────────────────────
 
-def _resolve_api_key(data: dict, model: str) -> str:
-    """Return the appropriate API key for *model* from the request body or env.
+def _resolve_api_key(
+    data: dict,
+    model: str,
+    *,
+    saved_openai_api_key: str = "",
+) -> str:
+    """Return a request key, with an explicit admin-only OpenAI fallback.
 
-    OpenAI models use the ``openai_api_key`` field / ``OPENAI_API_KEY`` env.
-    Gemini models use the ``gemini_api_key`` field / ``GEMINI_API_KEY`` env.
-    Anthropic models use the ``api_key`` field / ``ANTHROPIC_API_KEY`` env.
-    Per-request keys take priority over environment variables.
+    Public requests never inherit provider credentials from the process
+    environment. The caller may supply the saved OpenAI key only after it has
+    independently verified the admin session.
     """
     if is_openai_model(model):
         return (
             data.get("openai_api_key", "").strip()
-            or os.getenv("OPENAI_API_KEY", "")
+            or str(saved_openai_api_key or "").strip()
         )
     if is_gemini_model(model):
-        return (
-            data.get("gemini_api_key", "").strip()
-            or os.getenv("GEMINI_API_KEY", "")
-        )
-    return (
-        data.get("api_key", "").strip()
-        or os.getenv("ANTHROPIC_API_KEY", "")
-    )
+        return data.get("gemini_api_key", "").strip()
+    return data.get("api_key", "").strip()
 
 
 # ── Audit logic ───────────────────────────────────────────────────────────────
@@ -249,14 +247,51 @@ class AuditHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         path = self.path.split("?")[0]
-        if path not in ("/api/health", "/styles.css") and not self._site_access_allowed():
-            if path in ("/", "/index.html") or path.endswith("/report"):
-                self._serve_login_page()
+        analytics_page = path in {
+            "/analytics",
+            "/analytics/full-site",
+            "/analytics/url-list",
+        }
+        analytics_report = re.fullmatch(
+            r"/analytics/reports/\d{4}-\d{2}-\d{2}", path
+        )
+        analytics_api = path == "/api/admin/analytics"
+        protected_job_api = re.fullmatch(
+            r"/api/site-audits/[A-Za-z0-9_-]+(?:/report)?", path
+        )
+        if (
+            analytics_page
+            or analytics_report
+            or analytics_api
+            or protected_job_api
+        ) and not self._admin_access_allowed():
+            if analytics_api or protected_job_api:
+                self._send_json(
+                    {"success": False, "error": "Administrator sign-in required"},
+                    401,
+                )
             else:
-                self._send_json({"success": False, "error": "Authentication required"}, 401)
+                self._serve_login_page()
             return
+
         if path in ("/", "/index.html"):
             self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        elif path == "/analytics":
+            self._serve_file(
+                STATIC_DIR / "analytics.html",
+                "text/html; charset=utf-8",
+                cache_control="no-store",
+            )
+        elif path in {"/analytics/full-site", "/analytics/url-list"}:
+            self._serve_file(
+                STATIC_DIR / "index.html",
+                "text/html; charset=utf-8",
+                cache_control="no-store",
+            )
+        elif path == "/api/admin/analytics":
+            self._handle_admin_analytics()
+        elif analytics_report:
+            self._handle_daily_monitor_report(path)
         elif path == "/styles.css":
             self._serve_file(STATIC_DIR / "styles.css", "text/css; charset=utf-8")
         elif path == "/api/health":
@@ -270,7 +305,13 @@ class AuditHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404, "Not Found")
 
-    def _serve_file(self, file_path: Path, content_type: str):
+    def _serve_file(
+        self,
+        file_path: Path,
+        content_type: str,
+        *,
+        cache_control: str = "",
+    ):
         if not file_path.exists():
             self.send_error(404, "Not Found")
             return
@@ -278,6 +319,8 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
         self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
@@ -287,14 +330,23 @@ class AuditHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         if self.path == "/api/login":
             self._handle_login()
+        elif self.path == "/api/logout":
+            self._handle_logout()
         elif self.path.startswith("/api/internal/site-audits/"):
             operation = self.path.rsplit("/", 1)[-1]
             if operation not in {"discover", "page", "finalize", "daily-monitor"}:
                 self.send_error(404, "Not Found")
                 return
             self._handle_internal_site_audit(operation)
-        elif not self._site_access_allowed():
-            self._send_json({"success": False, "error": "Authentication required"}, 401)
+        elif (
+            self.path == "/api/site-audits"
+            or self.path == "/api/audit/url/nested"
+            or re.fullmatch(r"/api/site-audits/[A-Za-z0-9_-]+/resend", self.path)
+        ) and not self._admin_access_allowed():
+            self._send_json(
+                {"success": False, "error": "Administrator sign-in required"},
+                401,
+            )
         elif self.path == "/api/audit":
             self._handle_audit()
         elif self.path == "/api/audit/url":
@@ -310,34 +362,34 @@ class AuditHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404, "Not Found")
 
-    def _site_access_cookie(self) -> str:
+    def _admin_cookie(self) -> str:
         password = os.getenv("DAT_SITE_PASSWORD", "").strip()
         if not password:
             return ""
         return hashlib.sha256(f"vision-aid-dat:{password}".encode("utf-8")).hexdigest()
 
-    def _site_access_allowed(self) -> bool:
-        """Return whether the shared-password cookie is valid."""
-        expected = self._site_access_cookie()
+    def _admin_access_allowed(self) -> bool:
+        """Return whether the administrator cookie is valid."""
+        expected = self._admin_cookie()
         if not expected:
-            return True
+            return False
         cookies = self.headers.get("Cookie", "")
         supplied = ""
         for item in cookies.split(";"):
             name, _, value = item.strip().partition("=")
-            if name == "dat_access":
+            if name == "dat_admin":
                 supplied = value
                 break
         return bool(supplied and hmac.compare_digest(expected, supplied))
 
     def _serve_login_page(self):
         body = b"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Vision Aid DAT sign in</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Vision Aid DAT administrator sign in</title>
 <style>body{font-family:Arial,sans-serif;background:#eef4fb;color:#172033;margin:0;display:grid;min-height:100vh;place-items:center}.card{background:white;border:1px solid #c8d5e6;border-radius:12px;padding:32px;max-width:420px;width:calc(100% - 48px);box-shadow:0 10px 30px #17345c22}label{display:block;font-weight:700;margin:18px 0 6px}input,button{box-sizing:border-box;width:100%;padding:12px;font:inherit;border-radius:7px}input{border:1px solid #8194ac}button{margin-top:16px;background:#184b8a;color:white;border:0;font-weight:700;cursor:pointer}.error{color:#a32121}</style></head>
-<body><main class="card"><p>Vision Aid Digital Accessibility Testing</p><h1>Team testing access</h1>
+<body><main class="card"><p>Vision Aid Digital Accessibility Testing</p><h1>Administrator sign in</h1>
 <form id="login"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required autofocus>
-<button type="submit">Open DAT tool</button><p id="error" class="error" role="alert"></p></form></main>
-<script>document.getElementById('login').addEventListener('submit',async(e)=>{e.preventDefault();const error=document.getElementById('error');error.textContent='';const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});if(res.ok){location.reload();return;}error.textContent='Incorrect password.';});</script></body></html>"""
+<button type="submit">Open Analytics</button><p id="error" class="error" role="alert"></p></form><p><a href="/">Back to the public audit tool</a></p></main>
+<script>document.getElementById('login').addEventListener('submit',async(e)=>{e.preventDefault();const error=document.getElementById('error');error.textContent='';const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});if(res.ok){location.assign('/analytics');return;}error.textContent='Incorrect password.';});</script></body></html>"""
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -364,8 +416,25 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header(
             "Set-Cookie",
-            f"dat_access={self._site_access_cookie()}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{secure_flag}",
+            f"dat_admin={self._admin_cookie()}; Path=/; Max-Age=28800; HttpOnly; SameSite=Strict{secure_flag}",
         )
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_logout(self):
+        body = json.dumps({"success": True}).encode("utf-8")
+        secure_flag = "; Secure" if os.getenv("K_SERVICE") or self.headers.get(
+            "X-Forwarded-Proto", ""
+        ).lower() == "https" else ""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Set-Cookie",
+            f"dat_admin=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure_flag}",
+        )
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -409,7 +478,13 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
 
         model = data.get("model", "claude-haiku-4-5-20251001")
-        api_key = _resolve_api_key(data, model)
+        api_key = _resolve_api_key(
+            data,
+            model,
+            saved_openai_api_key=(
+                get_coordinator().api_key if self._admin_access_allowed() else ""
+            ),
+        )
 
         print(
             f"  Audit request: {len(html_content):,} chars, "
@@ -453,7 +528,13 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
 
         model = data.get("model", "claude-haiku-4-5-20251001")
-        api_key = _resolve_api_key(data, model)
+        api_key = _resolve_api_key(
+            data,
+            model,
+            saved_openai_api_key=(
+                get_coordinator().api_key if self._admin_access_allowed() else ""
+            ),
+        )
 
         print(
             f"  URL audit request ({'nested' if nested else 'single'}): {url}, "
@@ -677,6 +758,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 api_key=str(data.get("api_key", "")),
                 use_saved=bool(data.get("use_saved")),
                 refresh=True,
+                allow_saved_key=self._admin_access_allowed(),
             )
             self._send_json(
                 {
@@ -728,7 +810,11 @@ class AuditHandler(BaseHTTPRequestHandler):
             "yes",
         }
         try:
-            config = get_coordinator().public_config(model=model, refresh=refresh)
+            config = get_coordinator().public_config(
+                model=model,
+                refresh=refresh,
+                allow_saved_key=self._admin_access_allowed(),
+            )
         except ValueError as exc:
             self._send_json({"success": False, "error": str(exc)}, 400)
             return
@@ -754,6 +840,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 audit_mode=audit_mode,
                 uploaded_urls=uploaded_urls,
                 source_file_name=source_file_name,
+                allow_saved_key=self._admin_access_allowed(),
             )
         except ValueError as exc:
             self._send_json({"success": False, "error": str(exc)}, 400)
@@ -806,6 +893,53 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             return
         self._send_json({"success": True, "job": job})
+
+    def _handle_admin_analytics(self):
+        """Return privacy-safe administrator analytics and recent reports."""
+        try:
+            coordinator = get_coordinator()
+            self._send_json(
+                {
+                    "success": True,
+                    "summary": coordinator.analytics_summary(),
+                    "reports": coordinator.list_daily_monitor_reports(limit=30),
+                }
+            )
+        except Exception as exc:
+            print(f"  Administrator analytics failed: {exc}")
+            self._send_json(
+                {"success": False, "error": "Analytics are temporarily unavailable"},
+                503,
+            )
+
+    def _handle_daily_monitor_report(self, path: str):
+        """Serve one retained private daily report to an administrator."""
+        report_date = path.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            body = get_coordinator().daily_monitor_report_bytes(report_date)
+        except ValueError as exc:
+            self._send_json({"success": False, "error": str(exc)}, 400)
+            return
+        except Exception as exc:
+            print(f"  Daily monitor report retrieval failed: {exc}")
+            self._send_json(
+                {"success": False, "error": "The daily report is unavailable"},
+                503,
+            )
+            return
+        if body is None:
+            self.send_error(404, "Report not found")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+        )
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_internal_site_audit(self, operation: str):
         """Handle authenticated callbacks from the dedicated Cloud Tasks queue."""

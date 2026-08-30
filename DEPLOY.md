@@ -24,11 +24,13 @@ environment variables below, attach a domain, and deploy.
 | `DAT_DAILY_MONITOR_EMAIL` | For daily monitoring | Recipient for the 24-hour usage and health report |
 | `DAT_MONITOR_COLLECTION` | No | Firestore monitor-run collection; defaults to `dat_site_audit_monitor_runs` |
 | `DAT_USAGE_COLLECTION` | No | Privacy-safe synchronous-audit usage events; defaults to `dat_audit_usage_events` |
+| `DAT_SITE_PASSWORD` | For administrator tools | Shared password for Analytics and both bulk-audit modes; store in Secret Manager |
+| `DAT_OPENAI_API_KEY` | For administrator tools | Saved OpenAI key available only to authenticated administrators; store in Secret Manager |
 
-**No provider API keys are configured, deliberately.** Each user pastes their
-own key into the web form, so the deployment never bills a shared account.
-Per-request keys take priority over the environment
-(`api_server.py:_resolve_api_key`).
+Public users paste their own key into the web form and never inherit provider
+keys from the service environment. An authenticated administrator may use the
+saved `DAT_OPENAI_API_KEY`; per-request keys take priority. The raw saved key is
+never returned to the browser.
 
 Consequence worth knowing: **a request with no resolvable key silently runs a
 dry run** — programmatic checks only, no LLM findings, no CSV report, and a
@@ -109,6 +111,9 @@ each scanned site, mode, status, model, pages processed, page failures, and
 estimated AI cost. It also checks the public health endpoint, Firestore, report
 storage, background-audit configuration, the saved model credential, email
 configuration, and jobs that have stopped progressing for more than six hours.
+It also saves an HTML copy in private report storage. The protected Analytics
+page lists the latest 30 copies; older daily report records and objects are
+removed automatically.
 Synchronous modes store only operational totals (site host when available,
 model, status, token totals, estimated cost, and page counts), never uploaded
 HTML, provider credentials, or requester information.

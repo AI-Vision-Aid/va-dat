@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from html import escape
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -175,3 +176,83 @@ def build_daily_monitor_report(
         "subject": f"DAT daily monitor: {health_label} — {len(rows)} audit(s), {total_pages} page(s)",
         "text": "\n".join(lines) + "\n",
     }
+
+
+def build_daily_monitor_html(report: dict) -> bytes:
+    """Render a self-contained, admin-only web copy of a daily report."""
+    window_start = _utc(report.get("window_start"))
+    window_end = _utc(report.get("window_end"))
+    window_text = "Reporting window unavailable"
+    if window_start and window_end:
+        window_text = (
+            f"{window_start.astimezone(EASTERN):%Y-%m-%d %I:%M %p} to "
+            f"{window_end.astimezone(EASTERN):%Y-%m-%d %I:%M %p} Eastern"
+        )
+    status_class = {
+        "ok": "ok",
+        "warning": "warning",
+        "error": "error",
+    }.get(str(report.get("health_status")), "error")
+    friendly_checks = {
+        "service_endpoint": "Service health endpoint",
+        "core_configuration": "Background audit configuration",
+        "firestore": "Audit job database",
+        "report_storage": "Report storage",
+        "saved_model_key": "Saved AI model credential",
+        "email_configuration": "Email configuration",
+    }
+    check_items = "".join(
+        "<li><span>{}</span><strong class=\"{}\">{}</strong></li>".format(
+            escape(friendly_checks.get(name, name)),
+            "ok" if passed else "error",
+            "OK" if passed else "FAILED",
+        )
+        for name, passed in report.get("checks", {}).items()
+    )
+    issues = report.get("issues") or []
+    issue_section = ""
+    if issues:
+        issue_section = (
+            "<section><h2>Issues requiring attention</h2><ul>"
+            + "".join(f"<li>{escape(str(issue))}</li>" for issue in issues)
+            + "</ul></section>"
+        )
+    rows = []
+    for audit in report.get("audits", []):
+        cost = audit.get("estimated_cost_usd")
+        cost_text = f"${float(cost):.6f}" if cost is not None else "Pending/unavailable"
+        rows.append(
+            "<tr>"
+            f"<th scope=\"row\">{escape(str(audit.get('site') or 'Unknown site'))}</th>"
+            f"<td>{escape(str(audit.get('mode') or 'Unknown'))}</td>"
+            f"<td>{escape(str(audit.get('status') or 'unknown'))}</td>"
+            f"<td>{int(audit.get('pages_processed') or 0)} / {int(audit.get('pages_total') or 0)}</td>"
+            f"<td>{int(audit.get('pages_failed') or 0)}</td>"
+            f"<td>{escape(str(audit.get('model') or 'unknown'))}</td>"
+            f"<td>{escape(cost_text)}</td>"
+            "</tr>"
+        )
+    table_body = "".join(rows) or (
+        '<tr><td colspan="7">No audits were active during this reporting period.</td></tr>'
+    )
+    document = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>DAT daily monitor report</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:0;background:#f3f6fa;color:#172033;line-height:1.5}}main{{max-width:1100px;margin:auto;padding:32px 20px 56px}}a{{color:#174f8a}}.card{{background:#fff;border:1px solid #cad5e2;border-radius:12px;padding:22px;margin:18px 0}}.status{{display:inline-block;border-radius:999px;padding:6px 12px;font-weight:700}}.status.ok{{background:#dff4e8;color:#14532d}}.status.warning{{background:#fff1c7;color:#713f12}}.status.error{{background:#fde2e2;color:#7f1d1d}}.ok{{color:#166534}}.error{{color:#991b1b}}.checks{{padding:0;list-style:none}}.checks li{{display:flex;justify-content:space-between;gap:20px;border-bottom:1px solid #e5e9ef;padding:8px 0}}.totals{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}}.metric{{background:#eef4fb;border-radius:8px;padding:14px}}.metric strong{{display:block;font-size:1.35rem}}table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:10px;border:1px solid #d7dee8;text-align:left;vertical-align:top}}thead th{{background:#eaf1f8}}.table-wrap{{overflow-x:auto}}@media(max-width:600px){{main{{padding:20px 12px}}}}
+</style></head><body><main>
+<p><a href="/analytics">&larr; Back to Analytics</a></p>
+<h1>Vision Aid DAT daily usage and health report</h1>
+<p>{escape(window_text)}</p>
+<p><span class="status {status_class}">{escape(str(report.get('health_label') or 'UNKNOWN'))}</span></p>
+<section class="card"><h2>24-hour usage totals</h2><div class="totals">
+<div class="metric">Audit requests<strong>{int(report.get('audit_count') or 0)}</strong></div>
+<div class="metric">Pages processed<strong>{int(report.get('pages_processed') or 0)}</strong></div>
+<div class="metric">Pages failed<strong>{int(report.get('pages_failed') or 0)}</strong></div>
+<div class="metric">Estimated AI cost<strong>${float(report.get('estimated_cost_usd') or 0):.6f}</strong></div>
+</div></section>
+<section class="card"><h2>Health checks</h2><ul class="checks">{check_items}</ul></section>
+{issue_section}
+<section><h2>Sites and audits</h2><div class="table-wrap"><table><thead><tr><th>Site or source</th><th>Mode</th><th>Status</th><th>Pages processed / selected</th><th>Failed</th><th>Model</th><th>Estimated cost</th></tr></thead><tbody>{table_body}</tbody></table></div></section>
+</main></body></html>"""
+    return document.encode("utf-8")

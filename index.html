@@ -19,7 +19,7 @@
     />
 
     <!-- Stylesheet -->
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <!-- Skip to main content -->
@@ -54,6 +54,13 @@
               Audit Tool
             </button>
           </li>
+          <li class="protected-admin-nav" hidden>
+            <a href="/analytics/full-site">Full Site — Crawl and Email</a>
+          </li>
+          <li class="protected-admin-nav" hidden>
+            <a href="/analytics/url-list">Full Site — Batch and Email</a>
+          </li>
+          <li><a href="/analytics">Analytics</a></li>
         </ul>
       </nav>
     </header>
@@ -301,8 +308,7 @@
             <div class="accent-bar" aria-hidden="true"></div>
             <h2 id="audit-heading">Accessibility Audit Tool</h2>
             <p>
-              Audit one page, crawl an entire site, or upload a list of up to
-              200 URLs for asynchronous batch processing and email delivery.
+              Audit an HTML file or one public web page.
             </p>
           </div>
 
@@ -315,21 +321,21 @@
             >
               <p class="audit-mode-label" id="auditModeLabel">Input type</p>
               <div class="audit-mode-tabs">
-                <label class="audit-mode-tab">
+                <label class="audit-mode-tab public-mode-tab">
                   <input type="radio" name="auditMode" value="html" />
                   <span>HTML File</span>
                 </label>
-                <label class="audit-mode-tab">
-                  <input type="radio" name="auditMode" value="url" />
+                <label class="audit-mode-tab public-mode-tab">
+                  <input type="radio" name="auditMode" value="url" checked />
                   <span>URL &#8212; Single Page</span>
                 </label>
-                <label class="audit-mode-tab">
-                  <input type="radio" name="auditMode" value="site" checked />
+                <label class="audit-mode-tab admin-mode-tab" hidden>
+                  <input type="radio" name="auditMode" value="site" />
                   <span>Full Site &#8212; Crawl and Email</span>
                 </label>
-                <label class="audit-mode-tab">
+                <label class="audit-mode-tab admin-mode-tab" hidden>
                   <input type="radio" name="auditMode" value="url-list" />
-                  <span>URL List &#8212; Batch and Email</span>
+                  <span>Full Site &#8212; Batch and Email</span>
                 </label>
               </div>
             </div>
@@ -665,6 +671,37 @@
     </footer>
 
     <script>
+      const ADMIN_AUDIT_MODE = {
+        "/analytics/full-site": "site",
+        "/analytics/url-list": "url-list",
+      }[window.location.pathname] || "";
+
+      if (ADMIN_AUDIT_MODE) {
+        document.querySelectorAll(".protected-admin-nav").forEach((item) => {
+          item.hidden = false;
+        });
+        document.querySelectorAll(".public-mode-tab").forEach((item) => {
+          item.hidden = true;
+        });
+        document.querySelectorAll(".admin-mode-tab").forEach((item) => {
+          const input = item.querySelector("input");
+          item.hidden = input.value !== ADMIN_AUDIT_MODE;
+          input.checked = input.value === ADMIN_AUDIT_MODE;
+        });
+        document.getElementById("audit-heading").textContent =
+          ADMIN_AUDIT_MODE === "site"
+            ? "Full Site — Crawl and Email"
+            : "Full Site — Batch and Email";
+        document.querySelector("#auditTool .section-header p").textContent =
+          ADMIN_AUDIT_MODE === "site"
+            ? "Discover and audit up to 200 public pages, then email a consolidated report."
+            : "Upload up to 200 URLs for direct batch processing and an emailed consolidated report.";
+      } else {
+        document.querySelectorAll(".admin-mode-tab").forEach((item) => {
+          item.hidden = true;
+        });
+      }
+
       // ── Tab switching ──────────────────────────────────────────────────────────
       const auditTabBtn = document.getElementById("auditTabBtn");
       const projectContent = document.getElementById("projectContent");
@@ -719,6 +756,7 @@
         api_key_configured: false,
         api_key_verified: false,
         api_key_masked: "",
+        admin_authenticated: false,
       };
 
       function isAsyncBulkMode(mode = getAuditMode()) {
@@ -726,7 +764,7 @@
       }
 
       function showSavedKeyStatus() {
-        if (!isAsyncBulkMode() || apiKeyInput.value.trim()) return;
+        if (!ADMIN_AUDIT_MODE || apiKeyInput.value.trim()) return;
         const provider = getProvider(modelSelect.value);
         apiKeyValidateStatus.hidden = false;
         if (provider !== "openai") {
@@ -741,10 +779,12 @@
           apiKeyValidateStatus.className = "key-validate-status invalid";
           apiKeyValidateStatus.textContent =
             "Saved key configured but not verified for this model. Select Validate to retry.";
-        } else {
+        } else if (siteAuditConfig.admin_authenticated) {
           apiKeyValidateStatus.className = "key-validate-status invalid";
           apiKeyValidateStatus.textContent =
             "No saved OpenAI API key is available.";
+        } else {
+          apiKeyValidateStatus.hidden = true;
         }
       }
 
@@ -763,7 +803,7 @@
             showSavedKeyStatus();
           }
         } catch {
-          if (isAsyncBulkMode()) {
+          if (ADMIN_AUDIT_MODE) {
             apiKeyValidateStatus.hidden = false;
             apiKeyValidateStatus.className = "key-validate-status invalid";
             apiKeyValidateStatus.textContent =
@@ -774,7 +814,8 @@
 
       function updateApiKeyField() {
         const provider = getProvider(modelSelect.value);
-        const usesSavedKey = isAsyncBulkMode();
+        const usesSavedKey =
+          Boolean(ADMIN_AUDIT_MODE) && siteAuditConfig.admin_authenticated;
         if (provider === "openai") {
           apiKeyLabel.textContent = "OpenAI API Key";
           apiKeyInput.placeholder =
@@ -795,7 +836,7 @@
 
       modelSelect.addEventListener("change", () => {
         updateApiKeyField();
-        if (isAsyncBulkMode() && !apiKeyInput.value.trim()) {
+        if (ADMIN_AUDIT_MODE && !apiKeyInput.value.trim()) {
           loadSiteAuditConfig(modelSelect.value, false);
         }
       });
@@ -812,7 +853,8 @@
         const provider = getProvider(model);
         const useSaved =
           !key &&
-          isAsyncBulkMode() &&
+          Boolean(ADMIN_AUDIT_MODE) &&
+          siteAuditConfig.admin_authenticated &&
           provider === "openai" &&
           siteAuditConfig.api_key_configured;
         if (!key && !useSaved) {
@@ -893,7 +935,7 @@
 
       function submitButtonLabel(mode = getAuditMode()) {
         if (mode === "site") return "Queue Full-Site Audit";
-        if (mode === "url-list") return "Queue URL-List Audit";
+        if (mode === "url-list") return "Queue Full-Site Batch Audit";
         return "Run Audit";
       }
 
