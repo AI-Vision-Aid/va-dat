@@ -790,7 +790,7 @@ class DailyMonitorTests(unittest.TestCase):
             snapshot(
                 {
                     "email_hash": "hash-1",
-                    "site_hosts": ["example.org"],
+                    "base_url": "https://legacy.example.org/path",
                     "report_ready": False,
                     "pages_completed": 1,
                 }

@@ -1374,12 +1374,14 @@ class SiteAuditCoordinator:
         ]
         records = jobs + usage_events
         users = {str(item.get("email_hash")) for item in jobs if item.get("email_hash")}
-        sites = {
-            str(host).lower()
-            for item in records
-            for host in (item.get("site_hosts") or [])
-            if host
-        }
+        sites: set[str] = set()
+        for item in records:
+            hosts = [str(host).lower() for host in (item.get("site_hosts") or []) if host]
+            if not hosts:
+                legacy_host = urlparse(str(item.get("base_url") or "")).hostname
+                if legacy_host:
+                    hosts.append(legacy_host.lower())
+            sites.update(hosts)
         completed_sync = sum(item.get("status") == "complete" for item in usage_events)
         completed_reports = sum(bool(item.get("report_ready")) for item in jobs)
         input_tokens = sum(
