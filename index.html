@@ -727,8 +727,12 @@
         api_key_masked: "",
       };
 
+      function isAsyncBulkMode(mode = getAuditMode()) {
+        return mode === "site" || mode === "url-list";
+      }
+
       function showSavedKeyStatus() {
-        if (getAuditMode() !== "site" || apiKeyInput.value.trim()) return;
+        if (!isAsyncBulkMode() || apiKeyInput.value.trim()) return;
         const provider = getProvider(modelSelect.value);
         apiKeyValidateStatus.hidden = false;
         if (provider !== "openai") {
@@ -765,7 +769,7 @@
             showSavedKeyStatus();
           }
         } catch {
-          if (getAuditMode() === "site") {
+          if (isAsyncBulkMode()) {
             apiKeyValidateStatus.hidden = false;
             apiKeyValidateStatus.className = "key-validate-status invalid";
             apiKeyValidateStatus.textContent =
@@ -776,11 +780,11 @@
 
       function updateApiKeyField() {
         const provider = getProvider(modelSelect.value);
-        const isSite = getAuditMode() === "site";
+        const usesSavedKey = isAsyncBulkMode();
         if (provider === "openai") {
           apiKeyLabel.textContent = "OpenAI API Key";
           apiKeyInput.placeholder =
-            isSite && siteAuditConfig.api_key_configured
+            usesSavedKey && siteAuditConfig.api_key_configured
               ? (siteAuditConfig.api_key_masked || "••••••••••••••••") + " (saved)"
               : "sk-…";
         } else if (provider === "gemini") {
@@ -790,14 +794,14 @@
           apiKeyLabel.textContent = "Anthropic API Key";
           apiKeyInput.placeholder = "sk-ant-api03-…";
         }
-        apiKeyHint.textContent = isSite
+        apiKeyHint.textContent = usesSavedKey
           ? "The saved server key is used when this field is empty. Enter a different key only to override it for this audit; the saved key is never sent to your browser."
           : "Without a key, only programmatic checks run. Keys are never logged or returned by the server.";
       }
 
       modelSelect.addEventListener("change", () => {
         updateApiKeyField();
-        if (getAuditMode() === "site" && !apiKeyInput.value.trim()) {
+        if (isAsyncBulkMode() && !apiKeyInput.value.trim()) {
           loadSiteAuditConfig(modelSelect.value, false);
         }
       });
@@ -814,7 +818,7 @@
         const provider = getProvider(model);
         const useSaved =
           !key &&
-          getAuditMode() === "site" &&
+          isAsyncBulkMode() &&
           provider === "openai" &&
           siteAuditConfig.api_key_configured;
         if (!key && !useSaved) {
