@@ -60,7 +60,9 @@
           <li class="protected-admin-nav" hidden>
             <a href="/analytics/url-list">Full Site — Batch and Email</a>
           </li>
-          <li><a href="/analytics">Analytics</a></li>
+          <li class="protected-admin-nav" hidden>
+            <a href="/analytics">Analytics</a>
+          </li>
         </ul>
       </nav>
     </header>
@@ -651,6 +653,19 @@
               >Share Your Feedback</a
             >
           </div>
+          <div class="admin-login-container">
+            <a class="admin-login-btn" id="adminLoginBtn" href="/login?next=/"
+              >Login</a
+            >
+            <button
+              class="admin-login-btn"
+              id="adminLogoutBtn"
+              type="button"
+              hidden
+            >
+              Sign out
+            </button>
+          </div>
         </div>
       </section>
       <!-- /#auditTool -->
@@ -759,12 +774,32 @@
         admin_authenticated: false,
       };
 
+      function hasAdminAccess() {
+        return Boolean(ADMIN_AUDIT_MODE) || siteAuditConfig.admin_authenticated;
+      }
+
+      function applyAdminUi() {
+        const authenticated = siteAuditConfig.admin_authenticated;
+        document.querySelectorAll(".protected-admin-nav").forEach((item) => {
+          item.hidden = !authenticated;
+        });
+
+        if (!ADMIN_AUDIT_MODE) {
+          document.querySelectorAll(".admin-mode-tab").forEach((item) => {
+            item.hidden = !authenticated;
+          });
+        }
+
+        document.getElementById("adminLoginBtn").hidden = authenticated;
+        document.getElementById("adminLogoutBtn").hidden = !authenticated;
+      }
+
       function isAsyncBulkMode(mode = getAuditMode()) {
         return mode === "site" || mode === "url-list";
       }
 
       function showSavedKeyStatus() {
-        if (!ADMIN_AUDIT_MODE || apiKeyInput.value.trim()) return;
+        if (!hasAdminAccess() || apiKeyInput.value.trim()) return;
         const provider = getProvider(modelSelect.value);
         apiKeyValidateStatus.hidden = false;
         if (provider !== "openai") {
@@ -799,6 +834,7 @@
           const result = await response.json();
           if (response.ok && result.success) {
             siteAuditConfig = result.config;
+            applyAdminUi();
             updateApiKeyField();
             showSavedKeyStatus();
           }
@@ -814,8 +850,7 @@
 
       function updateApiKeyField() {
         const provider = getProvider(modelSelect.value);
-        const usesSavedKey =
-          Boolean(ADMIN_AUDIT_MODE) && siteAuditConfig.admin_authenticated;
+        const usesSavedKey = hasAdminAccess();
         if (provider === "openai") {
           apiKeyLabel.textContent = "OpenAI API Key";
           apiKeyInput.placeholder =
@@ -836,7 +871,7 @@
 
       modelSelect.addEventListener("change", () => {
         updateApiKeyField();
-        if (ADMIN_AUDIT_MODE && !apiKeyInput.value.trim()) {
+        if (hasAdminAccess() && !apiKeyInput.value.trim()) {
           loadSiteAuditConfig(modelSelect.value, false);
         }
       });
@@ -853,8 +888,7 @@
         const provider = getProvider(model);
         const useSaved =
           !key &&
-          Boolean(ADMIN_AUDIT_MODE) &&
-          siteAuditConfig.admin_authenticated &&
+          hasAdminAccess() &&
           provider === "openai" &&
           siteAuditConfig.api_key_configured;
         if (!key && !useSaved) {
@@ -971,6 +1005,13 @@
 
       applyAuditMode(getAuditMode());
       loadSiteAuditConfig();
+
+      document
+        .getElementById("adminLogoutBtn")
+        .addEventListener("click", async () => {
+          const response = await fetch("/api/logout", { method: "POST" });
+          if (response.ok) window.location.assign("/");
+        });
 
       // ── Drag-and-drop / file input ────────────────────────────────────────────
       let htmlFileContent = null;

@@ -246,7 +246,8 @@ class AuditHandler(BaseHTTPRequestHandler):
     # GET ──────────────────────────────────────────────────────────────────────
 
     def do_GET(self):  # noqa: N802
-        path = self.path.split("?")[0]
+        request_url = urlparse(self.path)
+        path = request_url.path
         analytics_page = path in {
             "/analytics",
             "/analytics/full-site",
@@ -271,11 +272,14 @@ class AuditHandler(BaseHTTPRequestHandler):
                     401,
                 )
             else:
-                self._serve_login_page()
+                self._serve_login_page(path)
             return
 
         if path in ("/", "/index.html"):
             self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        elif path == "/login":
+            requested_next = parse_qs(request_url.query).get("next", ["/"])[0]
+            self._serve_login_page(requested_next)
         elif path == "/analytics":
             self._serve_file(
                 STATIC_DIR / "analytics.html",
@@ -382,17 +386,32 @@ class AuditHandler(BaseHTTPRequestHandler):
                 break
         return bool(supplied and hmac.compare_digest(expected, supplied))
 
-    def _serve_login_page(self):
-        body = b"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+    @staticmethod
+    def _safe_admin_return_path(next_path: str) -> str:
+        allowed_paths = {
+            "/",
+            "/analytics",
+            "/analytics/full-site",
+            "/analytics/url-list",
+        }
+        return next_path if next_path in allowed_paths else "/"
+
+    def _serve_login_page(self, next_path: str = "/"):
+        safe_next_path = self._safe_admin_return_path(next_path)
+        page = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Vision Aid DAT administrator sign in</title>
 <style>body{font-family:Arial,sans-serif;background:#eef4fb;color:#172033;margin:0;display:grid;min-height:100vh;place-items:center}.card{background:white;border:1px solid #c8d5e6;border-radius:12px;padding:32px;max-width:420px;width:calc(100% - 48px);box-shadow:0 10px 30px #17345c22}label{display:block;font-weight:700;margin:18px 0 6px}input,button{box-sizing:border-box;width:100%;padding:12px;font:inherit;border-radius:7px}input{border:1px solid #8194ac}button{margin-top:16px;background:#184b8a;color:white;border:0;font-weight:700;cursor:pointer}.error{color:#a32121}</style></head>
 <body><main class="card"><p>Vision Aid Digital Accessibility Testing</p><h1>Administrator sign in</h1>
 <form id="login"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required autofocus>
-<button type="submit">Open Analytics</button><p id="error" class="error" role="alert"></p></form><p><a href="/">Back to the public audit tool</a></p></main>
-<script>document.getElementById('login').addEventListener('submit',async(e)=>{e.preventDefault();const error=document.getElementById('error');error.textContent='';const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});if(res.ok){location.assign('/analytics');return;}error.textContent='Incorrect password.';});</script></body></html>"""
+<button type="submit">Login</button><p id="error" class="error" role="alert"></p></form><p><a href="/">Back to the public audit tool</a></p></main>
+<script>const nextPath=__NEXT_PATH__;document.getElementById('login').addEventListener('submit',async(e)=>{e.preventDefault();const error=document.getElementById('error');error.textContent='';const res=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('password').value})});if(res.ok){location.assign(nextPath);return;}error.textContent='Incorrect password.';});</script></body></html>"""
+        body = page.replace("__NEXT_PATH__", json.dumps(safe_next_path)).encode(
+            "utf-8"
+        )
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 

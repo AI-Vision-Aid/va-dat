@@ -52,7 +52,22 @@ class AuditModeUiTests(unittest.TestCase):
         self.assertIn('value="url" checked', html)
         self.assertIn('class="audit-mode-tab admin-mode-tab" hidden', html)
         self.assertIn("Full Site &#8212; Crawl and Email", html)
-        self.assertIn('href="/analytics">Analytics</a>', html)
+        self.assertIn(
+            '<li class="protected-admin-nav" hidden>\n'
+            '            <a href="/analytics">Analytics</a>',
+            html,
+        )
+
+    def test_login_is_below_feedback_and_admin_navigation_starts_hidden(self):
+        html = (Path(__file__).resolve().parents[1] / "index.html").read_text(
+            encoding="utf-8"
+        )
+        feedback_position = html.index("Share Your Feedback")
+        login_position = html.index('id="adminLoginBtn"')
+        self.assertGreater(login_position, feedback_position)
+        self.assertIn('href="/login?next=/"', html)
+        self.assertIn('id="adminLogoutBtn"', html)
+        self.assertIn('class="protected-admin-nav" hidden', html)
 
     def test_analytics_page_links_to_both_protected_bulk_tools(self):
         html = (Path(__file__).resolve().parents[1] / "analytics.html").read_text(
@@ -427,6 +442,16 @@ class EmailTests(unittest.TestCase):
 
 
 class AccessControlTests(unittest.TestCase):
+    def test_admin_login_return_path_is_restricted_to_local_admin_pages(self):
+        self.assertEqual(AuditHandler._safe_admin_return_path("/"), "/")
+        self.assertEqual(
+            AuditHandler._safe_admin_return_path("/analytics/full-site"),
+            "/analytics/full-site",
+        )
+        self.assertEqual(
+            AuditHandler._safe_admin_return_path("https://evil.example/"), "/"
+        )
+
     def test_admin_cookie_is_required_and_compared(self):
         handler = object.__new__(AuditHandler)
         with mock.patch.dict(os.environ, {"DAT_SITE_PASSWORD": "test-password"}):
